@@ -1,0 +1,12 @@
+def test_core_imports():
+    import config
+    import data.market_data
+    import data.fundamentals
+    import data.macro
+    import data.news
+    import features.technical
+    import features.sentiment
+    import models.ensemble
+    import prediction.predictor
+    import backtest.backtest
+    import storage.database

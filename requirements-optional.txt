@@ -1,0 +1,2 @@
+# Optional advanced provider. The app works without it.
+openbb>=4.4,<5; python_version < "3.13"

@@ -1,0 +1,12 @@
+[
+  "tests/test_backtest.py::test_backtest",
+  "tests/test_database.py::test_database",
+  "tests/test_imports.py::test_core_imports",
+  "tests/test_max_features.py::test_context_features",
+  "tests/test_max_features.py::test_news_dedupe",
+  "tests/test_max_features.py::test_walk_forward_smoke",
+  "tests/test_monte_carlo.py::test_expected_range",
+  "tests/test_monte_carlo.py::test_touch_probability",
+  "tests/test_technical.py::test_indicators",
+  "tests/test_training.py::test_training"
+]

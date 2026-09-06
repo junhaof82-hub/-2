@@ -1,0 +1,16 @@
+STOCK AI MAX
+============
+
+RECOMMENDED: use it as an ONLINE WEB APP.
+Open DEPLOY_ONLINE.md and follow the Streamlit Community Cloud steps.
+After deployment, you only open your *.streamlit.app URL.
+
+You do NOT need the BAT file for cloud use.
+
+Local use is optional:
+1) Install Python 3.12
+2) pip install -r requirements.txt
+3) streamlit run app.py
+
+Important: no stock model can guarantee the highest accuracy or capture every piece of news.
+MAX is designed to maximize useful coverage while showing confidence and data-quality limits.
