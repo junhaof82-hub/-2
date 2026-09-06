@@ -1,29 +1,26 @@
-# Stock AI MAX ULTRA v3 — Test Report
+# Stock AI MAX ULTRA X v4.0 Test Report
 
-Build date: 2026-09-06
+## Completed
 
-## Passed checks
-- Python `py_compile`: PASS
-- Synthetic OHLCV indicator pipeline: PASS
-- RSI/MACD/ATR/ADX/Stochastic/MFI/OBV/volume features: PASS
-- News scoring and recency weighting: PASS
-- Empirical Monte Carlo bootstrap: PASS
-- Four-model 1D/3D/5D training pipeline: PASS
-- Chronological validation/test split: PASS
-- Probability calibration fallback / shrinkage: PASS
-- Full offline `analyze_max()` integration with mocked live providers: PASS
-- Risk / confidence / data-quality bounds: PASS
+- `app.py` Python syntax compile: PASS
+- `streamlit_app.py` Python syntax compile: PASS
+- Valuation engine pure-function test: PASS
+- Positive-FCF DCF/FCF-yield/PE multi-method case: PASS
+- Negative-FCF fallback valuation case: PASS
+- Earnings surprise scoring test: PASS
+- Analyst recommendation scoring test: PASS
+- No API keys embedded: PASS
+- Cloud-safe wrapper uses `runpy.run_path(..., run_name="__main__")`: PASS
 
-## Cloud stability protections verified in code
-- No heavy analysis on initial page load
-- Network calls use explicit connect/read timeouts
-- Retries are bounded to one retry
-- Main analysis, news aggregation, intraday fetch and scanner use Streamlit-safe sequential execution
-- Random Forest / Extra Trees use `n_jobs=1`
-- Options analysis is opt-in and off by default
-- Cached functions have TTL and max-entry limits
-- Provider failures are isolated and returned in module-health tables
-- Top-level exception shield renders a diagnostic instead of a blank page
+## Design checks
 
-## Note
-Live external APIs were not called in the offline test environment. The code is designed to fail soft and fall back when a provider is unavailable or an API key is missing.
+- Heavy model training is not executed on initial page load.
+- Live auto refresh is isolated to a lightweight 30-second Streamlit fragment.
+- OpenAI Web and Options are user-triggered, not automatic.
+- Network providers are timeout/retry bounded and failure-isolated.
+- ML tree models remain single-threaded (`n_jobs=1`).
+- Top-level exception handler renders diagnostic UI instead of intentional blank output.
+
+## Environment note
+
+The artifact build container used for this patch did not have Streamlit/yfinance installed, so a live Streamlit server launch was not performed here. The app and wrapper compiled successfully, and the new pure calculation modules were executed directly. Streamlit Cloud installs the pinned dependencies from `requirements.txt` during deployment.
