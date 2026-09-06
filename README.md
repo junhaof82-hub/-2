@@ -1,146 +1,75 @@
-# Stock AI MAX ULTRA X v4.0
+# Stock AI MAX — INSTITUTIONAL FINAL (Cloud-Safe)
 
-这是给你现有 Streamlit 股票 AI 的**直接覆盖升级版**。设计原则：尽量扩大实时/事件/财报/估值覆盖，同时保护 Streamlit Community Cloud，避免因为一次分析过重而黑屏。
+这是给现有 Streamlit Cloud 股票 AI 的直接覆盖升级版。目标是：尽量扩大实时信息覆盖、提高概率可信度，同时优先避免 Community Cloud 因 CPU / 内存 / 超时而黑屏。
 
 ## 你只需要覆盖 3 个文件
 
-把本包中的以下文件上传到你现在的 GitHub 仓库，覆盖旧文件：
+上传到你当前 GitHub 仓库根目录并覆盖：
 
 - `app.py`
 - `streamlit_app.py`
 - `requirements.txt`
 
-Streamlit 的 Main file path 继续设为：
+Streamlit 的 Main file path 保持：
 
-```text
-app.py
-```
+`app.py`
 
-`streamlit_app.py` 是保险入口：如果以后 Streamlit 又误选它，它会用 `runpy` 每次重新执行 `app.py`，不会再用 `from app import *` 导致空白/黑屏。
+提交后等待自动部署；若没有自动更新：Manage app -> Reboot app。
 
-## v4 新增核心
+## 核心升级
 
-### 1. 30 秒实时价格脉冲
-- 页面打开后，只有轻量 Quote 卡片每 30 秒独立刷新。
-- 不会每 30 秒重新训练模型。
-- Massive/Polygon 有 Key 时优先 Unified Snapshot；否则 Finnhub，再 fallback Yahoo。
-- 是否真正实时取决于你的数据套餐 / 交易所 entitlement。
+- 实时行情 fallback：Massive/Polygon -> Finnhub -> FMP -> Alpha Vantage -> Yahoo Finance
+- 盘中 1h / 15m / 5m：Massive/Polygon -> Alpha Vantage -> Yahoo Finance
+- 新闻/事件：Yahoo + SEC EDGAR + Alpha Vantage + Finnhub + Marketaux + FMP
+- 新闻事件分类：财报/指引、分析师动作、M&A、产品/AI需求、监管/法律、资本结构、内部人/持股
+- 来源可靠度、新闻重要度、时间衰减、方向一致度
+- 宏观：SPY / QQQ / SMH / VIX / 10Y / DXY + 11 个行业 ETF 市场广度 + 可选 FRED
+- 基本面：Yahoo + Alpha + Finnhub + FMP 互相补充
+- 财报：EPS surprise / beat rate / 下次财报 / Alpha earnings calendar
+- 机构：Finnhub recommendation / target / upgrade-downgrade / forward EPS & revenue estimates
+- 同行相对强弱：Finnhub peers + 20D percentile
+- 估值：增长调整 Forward P/E + FCF Yield + 5Y FCF DCF + analyst target consensus
+- ML：Logistic + Random Forest + Extra Trees + Histogram Gradient Boosting
+- 1D / 3D / 5D 概率校准、时间顺序 holdout、模型质量加权
+- 市场 regime 与同行/预期的小幅动态修正
+- Monte Carlo empirical bootstrap（保留肥尾）
+- Bull / Base / Bear 场景概率
+- Confidence / Data Quality / Freshness / Reliability Grade
+- 可选 OpenAI Web 最新事件核验（只在手动开启时运行）
 
-### 2. 新闻 + SEC + AI Web
-- Yahoo Finance news
-- Alpha Vantage NEWS_SENTIMENT（有 Key）
-- Finnhub company news（有 Key）
-- Marketaux（有 Key）
-- SEC EDGAR 官方 8-K / 10-Q / 10-K / Form 4 / 13D / 13G / S-3 / 424B5
-- OpenAI Responses + Web Search（可选、按按钮启用）
+## 黑屏保护
 
-OpenAI Web 只做**最新事件核验和解释**，不会直接把 LLM 的文字当成交易概率，避免“AI 说多就是多”的问题。
-
-### 3. 财报/机构系统
-- Alpha Vantage quarterly EPS history / surprise
-- Finnhub earnings calendar
-- Finnhub recommendation trends
-- Finnhub analyst price target
-- Finnhub upgrade/downgrade（取决于套餐）
-- 财报临近会提高 Risk，而不会自动假定涨或跌
-
-### 4. 新估值引擎
-同时尝试：
-- Growth-adjusted Forward P/E
-- Free Cash Flow Yield
-- 5-year FCF DCF（Bear / Base / Bull assumptions）
-- Analyst target consensus
-
-最后输出：
-- Valuation Score
-- Fair Value
-- Fair Low / Fair High
-- Upside / Downside
-- Valuation Confidence
-- WACC assumption
-- Growth assumption
-
-缺数据、负 FCF、亏损公司会自动减少可用估值方法，不硬算。
-
-### 5. 概率融合升级
-最终 1D / 3D / 5D 概率现在融合：
-- ML ensemble
-- Technical
-- 1h / 15m / 5m Intraday
-- News
-- Macro
-- Fundamentals
-- Earnings history/event risk
-- Analyst consensus
-- Valuation
-
-权重按预测周期变化：1D 更看盘中/新闻；5D 增加基本面/估值权重。
-
-### 6. 黑屏保护
-- 主程序单文件结构
-- `streamlit_app.py` 安全 wrapper
-- 顶层 Crash Shield
-- 每个 API 独立 timeout
-- retry 次数上限
-- ML `n_jobs=1`
-- 不在页面启动时训练模型
+- BLAS / sklearn 单线程限制
+- 所有外部 API 有 connect/read timeout
+- retry 数量有限
+- 新闻源约 22 秒总预算
+- 补充基本面约 20 秒总预算
+- 总分析软预算默认 72 秒
 - Options 默认关闭
-- OpenAI Web 默认关闭
-- 历史数据、新闻条数、Monte Carlo 路径数有上限
-- 重模块顺序执行
-- 只有 Quote 使用 30 秒 `st.fragment` 独立刷新
-- 模块失败只降低 Data Quality，不应该拖垮整页
+- AI Web 默认关闭
+- Monte Carlo 路径数量受限
+- Scanner 不对每一只股票训练全部模型
+- 完整分析缓存 5 分钟；实时报价单独 20 秒刷新，不会反复训练模型
+- 单个模块失败只降低 Data Quality，不让整个页面失败
+- 顶层 Crash Shield 显示错误，而不是空白页
+- `streamlit_app.py` 使用 `exec` 安全执行主文件，避免之前 `from app import *` 的 rerun 黑屏问题
 
-## Streamlit Secrets
+## 推荐 Streamlit Secrets
 
-在：
+复制 `SECRETS_TEMPLATE.toml` 的内容到 Streamlit -> Manage app -> Settings -> Secrets。
 
-`Manage app -> Settings -> Secrets`
+建议优先：
 
-按需填：
+1. MASSIVE_API_KEY
+2. FINNHUB_API_KEY
+3. ALPHA_VANTAGE_API_KEY
+4. MARKETAUX_API_KEY
+5. FMP_API_KEY
+6. FRED_API_KEY
+7. OPENAI_API_KEY（可选，AI Web 核验）
 
-```toml
-MASSIVE_API_KEY = ""
-ALPHA_VANTAGE_API_KEY = ""
-FINNHUB_API_KEY = ""
-MARKETAUX_API_KEY = ""
-FRED_API_KEY = ""
-OPENAI_API_KEY = ""
-OPENAI_MODEL = "gpt-5"
-SEC_USER_AGENT = "Your Name your-email@example.com"
-```
+不要把真实 API key 上传到 GitHub。
 
-**不要把真实 API Key 放进 GitHub。**
+## 重要说明
 
-## 推荐启用顺序
-
-如果你暂时不想一次申请很多：
-
-1. Massive/Polygon — 更好的实时/盘中价格
-2. Finnhub — 公司新闻、财报日历、机构评级、目标价
-3. Alpha Vantage — 新闻情绪、EPS surprise、财务 Overview
-4. Marketaux — 扩大媒体新闻覆盖
-5. FRED — 官方宏观数据
-6. OpenAI — 最新网页事件搜索与解释（按需开启）
-
-## 使用
-
-部署后直接输入：
-
-```text
-NVDA
-AVGO
-SNDK
-AMAT
-AMZN
-GOOGL
-NBIS
-```
-
-点击 `开始 ULTRA X`。
-
-如果已经填了 `OPENAI_API_KEY`，需要最新网页核验时再打开 `AI Web 最新情报`。
-
-## 重要限制
-
-没有任何系统能覆盖互联网上 100% 的消息、保证实时零延迟或保证未来价格预测准确。这个版本的目标是：**多来源交叉验证 + 时间顺序回测 + 概率校准 + 数据质量收缩 + 风险保护**，而不是制造虚假的 90%+ 确定性。
+这是研究/决策支持系统，不是保证盈利的软件。没有系统能够覆盖 100% 的市场信息或保证某个概率一定实现。系统在数据不完整、模型分歧大或实时源较旧时会主动降低 Confidence，而不是给出虚假的高确定性。

@@ -1,0 +1,10 @@
+UPLOAD AND OVERWRITE ONLY THESE 3 FILES IN YOUR CURRENT GITHUB REPOSITORY:
+
+1. app.py
+2. streamlit_app.py
+3. requirements.txt
+
+Then keep Streamlit Main file path = app.py
+Wait for automatic redeploy or use Manage app -> Reboot app.
+
+Do NOT upload your real API keys.

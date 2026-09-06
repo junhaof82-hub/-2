@@ -40,7 +40,7 @@ from sklearn.metrics import accuracy_score, brier_score_loss, precision_score, r
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "FINAL-2026.09"
 ET = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
@@ -90,7 +90,8 @@ def api_keys() -> dict[str, str]:
         "fred": _secret("FRED_API_KEY"),
         "sec_agent": _secret("SEC_USER_AGENT", "StockAIMAX research-app contact@example.com"),
         "openai": _secret("OPENAI_API_KEY"),
-        "openai_model": _secret("OPENAI_MODEL", "gpt-5"),
+        "openai_model": _secret("OPENAI_MODEL", "gpt-5.6-sol"),
+        "fmp": _secret("FMP_API_KEY"),
     }
 
 
@@ -113,7 +114,7 @@ def http_session() -> requests.Session:
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=6, pool_maxsize=6)
     s.mount("https://", adapter)
-    s.headers.update({"Accept": "application/json", "User-Agent": "StockAIMAX/4.0"})
+    s.headers.update({"Accept": "application/json", "User-Agent": "StockAIMAX-Institutional/2026.09"})
     return s
 
 
@@ -168,6 +169,28 @@ def safe_call(name: str, fn: Callable[[], Any]) -> tuple[str, Any | None, str | 
         return name, out, None, time.perf_counter() - t0
     except Exception as e:
         return name, None, f"{type(e).__name__}: {e}", time.perf_counter() - t0
+
+
+@dataclass
+class ExecutionBudget:
+    """Soft wall-clock budget. Optional blocks are skipped before Cloud can exhaust resources."""
+    seconds: float = 72.0
+    started: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not self.started:
+            self.started = time.perf_counter()
+
+    @property
+    def elapsed(self) -> float:
+        return time.perf_counter() - self.started
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, self.seconds - self.elapsed)
+
+    def allow(self, minimum_remaining: float = 8.0) -> bool:
+        return self.remaining >= minimum_remaining
 
 
 # -----------------------------------------------------------------------------
@@ -327,6 +350,35 @@ def finnhub_quote(ticker: str, api_key: str) -> dict[str, Any]:
 
 
 @st.cache_data(ttl=20, max_entries=64, show_spinner=False)
+def alpha_quote(ticker: str, api_key: str) -> dict[str, Any]:
+    if not api_key:
+        return {}
+    data, err = safe_json("https://www.alphavantage.co/query", params={"function": "GLOBAL_QUOTE", "symbol": ticker.upper(), "apikey": api_key}, timeout=(3, 5))
+    if err or not isinstance(data, dict):
+        return {}
+    q = data.get("Global Quote") or {}
+    price = _num(q.get("05. price"))
+    if price is None:
+        return {}
+    pct = str(q.get("10. change percent") or "").replace("%", "")
+    return {"price": price, "change_pct": _num(pct), "open": _num(q.get("02. open")), "high": _num(q.get("03. high")), "low": _num(q.get("04. low")), "volume": _num(q.get("06. volume")), "updated": None, "source": "Alpha Vantage Quote"}
+
+
+@st.cache_data(ttl=20, max_entries=64, show_spinner=False)
+def fmp_quote(ticker: str, api_key: str) -> dict[str, Any]:
+    if not api_key:
+        return {}
+    data, err = safe_json(f"https://financialmodelingprep.com/api/v3/quote/{ticker.upper()}", params={"apikey": api_key}, timeout=(3, 5))
+    if err or not isinstance(data, list) or not data:
+        return {}
+    q = data[0] or {}
+    price = _num(q.get("price"))
+    if price is None:
+        return {}
+    return {"price": price, "change_pct": _num(q.get("changesPercentage")), "open": _num(q.get("open")), "high": _num(q.get("dayHigh")), "low": _num(q.get("dayLow")), "volume": _num(q.get("volume")), "updated": q.get("timestamp"), "source": "FMP Quote"}
+
+
+@st.cache_data(ttl=20, max_entries=64, show_spinner=False)
 def current_snapshot(ticker: str) -> dict[str, Any]:
     keys = api_keys()
     if keys["massive"]:
@@ -335,6 +387,14 @@ def current_snapshot(ticker: str) -> dict[str, Any]:
             return x
     if keys["finnhub"]:
         x = finnhub_quote(ticker, keys["finnhub"])
+        if x:
+            return x
+    if keys["fmp"]:
+        x = fmp_quote(ticker, keys["fmp"])
+        if x:
+            return x
+    if keys["alpha"]:
+        x = alpha_quote(ticker, keys["alpha"])
         if x:
             return x
     try:
@@ -394,6 +454,29 @@ def massive_bars(ticker: str, interval: str, api_key: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+@st.cache_data(ttl=300, max_entries=96, show_spinner=False)
+def alpha_intraday_bars(ticker: str, interval: str, api_key: str) -> pd.DataFrame:
+    if not api_key:
+        return pd.DataFrame()
+    av = {"5m": "5min", "15m": "15min", "1h": "60min"}.get(interval)
+    if not av:
+        return pd.DataFrame()
+    data, err = safe_json("https://www.alphavantage.co/query", params={"function": "TIME_SERIES_INTRADAY", "symbol": ticker.upper(), "interval": av, "outputsize": "compact", "extended_hours": "true", "apikey": api_key}, timeout=(3, 7))
+    if err or not isinstance(data, dict):
+        return pd.DataFrame()
+    key = next((k for k in data if "Time Series" in k), None)
+    rows = data.get(key) if key else None
+    if not isinstance(rows, dict) or not rows:
+        return pd.DataFrame()
+    try:
+        df = pd.DataFrame.from_dict(rows, orient="index")
+        df.index = pd.to_datetime(df.index)
+        df = df.rename(columns={"1. open":"Open", "2. high":"High", "3. low":"Low", "4. close":"Close", "5. volume":"Volume"})
+        return _clean_ohlcv(df)
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=300, max_entries=128, show_spinner=False)
 def intraday_bars(ticker: str, interval: str) -> tuple[pd.DataFrame, str]:
     keys = api_keys()
@@ -401,6 +484,10 @@ def intraday_bars(ticker: str, interval: str) -> tuple[pd.DataFrame, str]:
         d = massive_bars(ticker, interval, keys["massive"])
         if not d.empty:
             return d, "Massive/Polygon"
+    if keys["alpha"]:
+        d = alpha_intraday_bars(ticker, interval, keys["alpha"])
+        if not d.empty:
+            return d, "Alpha Vantage"
     period = {"5m": "5d", "15m": "10d", "1h": "3mo"}.get(interval, "5d")
     d = yf_history(ticker, period, interval, True)
     return d, "Yahoo Finance"
@@ -818,6 +905,40 @@ def marketaux_news(ticker: str, api_key: str) -> list[dict[str, Any]]:
     return out
 
 
+@st.cache_data(ttl=300, max_entries=64, show_spinner=False)
+def fmp_news(ticker: str, api_key: str) -> list[dict[str, Any]]:
+    """FMP news fallback. Supports both stable and legacy endpoints; failures are silent."""
+    if not api_key:
+        return []
+    candidates = [
+        ("https://financialmodelingprep.com/stable/news/stock", {"symbols": ticker.upper(), "limit": 80, "apikey": api_key}),
+        ("https://financialmodelingprep.com/api/v3/stock_news", {"tickers": ticker.upper(), "limit": 80, "apikey": api_key}),
+    ]
+    data = None
+    for url, params in candidates:
+        d, err = safe_json(url, params=params, timeout=(3, 7))
+        if not err and isinstance(d, list):
+            data = d
+            break
+    if not isinstance(data, list):
+        return []
+    out = []
+    for n in data[:80]:
+        title = n.get("title") or n.get("headline") or ""
+        if not title:
+            continue
+        out.append({
+            "title": title,
+            "summary": n.get("text") or n.get("summary") or n.get("content") or "",
+            "provider": n.get("site") or n.get("publisher") or "FMP",
+            "url": n.get("url") or "",
+            "published": n.get("publishedDate") or n.get("date") or n.get("published_at"),
+            "native_sentiment": None,
+            "source_family": "FMP",
+        })
+    return out
+
+
 @st.cache_data(ttl=86400, max_entries=1, show_spinner=False)
 def sec_ticker_map(user_agent: str) -> dict[str, int]:
     data, err = safe_json(
@@ -862,6 +983,44 @@ def sec_filings(ticker: str, user_agent: str) -> list[dict[str, Any]]:
     return out
 
 
+EVENT_RULES: list[tuple[str, tuple[str, ...], float]] = [
+    ("Earnings/Guidance", ("earnings", "eps", "revenue", "guidance", "outlook", "quarter"), 1.35),
+    ("Analyst Action", ("upgrade", "downgrade", "price target", "outperform", "underperform"), 1.15),
+    ("M&A/Strategic", ("acquisition", "acquire", "merger", "strategic review", "joint venture"), 1.25),
+    ("Product/AI Demand", ("launch", "product", "ai", "gpu", "accelerator", "demand", "customer", "contract"), 1.10),
+    ("Regulatory/Legal", ("antitrust", "doj", "ftc", "lawsuit", "probe", "investigation", "regulatory", "tariff"), 1.30),
+    ("Capital/Balance Sheet", ("buyback", "dividend", "offering", "convertible", "debt", "dilution", "shelf"), 1.20),
+    ("Insider/Ownership", ("insider", "form 4", "13d", "13g", "stake", "ownership"), 1.00),
+]
+
+SOURCE_RELIABILITY = {
+    "sec": 1.30, "reuters": 1.25, "bloomberg": 1.22, "wall street journal": 1.18,
+    "wsj": 1.18, "associated press": 1.16, "cnbc": 1.08, "company": 1.15,
+}
+
+
+def classify_event(text: str, form: str = "") -> tuple[str, float]:
+    tx = (text or "").lower()
+    if form in {"10-Q", "10-K", "8-K"}:
+        return ("SEC Material Filing", 1.35)
+    best = ("General", 1.0)
+    best_hits = 0
+    for label, kws, mult in EVENT_RULES:
+        hits = sum(1 for k in kws if k in tx)
+        if hits > best_hits:
+            best_hits = hits
+            best = (label, mult)
+    return best
+
+
+def _source_reliability(provider: str) -> float:
+    p = (provider or "").lower()
+    for k, v in SOURCE_RELIABILITY.items():
+        if k in p:
+            return v
+    return 1.0
+
+
 def score_news(items: list[dict[str, Any]]) -> dict[str, Any]:
     now = datetime.now(UTC)
     scored = []
@@ -890,10 +1049,11 @@ def score_news(items: list[dict[str, Any]]) -> dict[str, Any]:
         pub = _parse_pub(it.get("published"))
         age_h = max(0.0, (now - pub).total_seconds() / 3600) if pub else 72.0
         recency = math.exp(-age_h / 72.0)
-        provider = str(it.get("provider", "")).lower()
-        quality = 1.15 if any(k in provider for k in HIGH_QUALITY_SOURCES) else 1.0
-        weight = max(0.15, importance / 10) * (0.35 + 0.65 * recency) * quality
-        scored.append({**it, "score": sentiment, "importance": importance, "age_hours": age_h, "weight": weight})
+        provider = str(it.get("provider", ""))
+        event_type, event_mult = classify_event(text, form)
+        quality = _source_reliability(provider)
+        weight = max(0.15, importance / 10) * (0.30 + 0.70 * recency) * quality * event_mult
+        scored.append({**it, "score": sentiment, "importance": importance, "age_hours": age_h, "weight": weight, "event_type": event_type, "source_reliability": quality})
 
     if scored:
         w = np.array([s["weight"] for s in scored], float)
@@ -903,7 +1063,15 @@ def score_news(items: list[dict[str, Any]]) -> dict[str, Any]:
         overall = 0.0
     cats = [k for k in CATALYST_WORDS if any(k in (str(s.get("title", "")) + " " + str(s.get("summary", ""))).lower() for s in scored)]
     risks = [k for k in RISK_WORDS if any(k in (str(s.get("title", "")) + " " + str(s.get("summary", ""))).lower() for s in scored)]
-    return {"score": overall, "items": sorted(scored, key=lambda z: (z["age_hours"], -z["importance"])), "catalysts": cats[:10], "risks": risks[:10]}
+    event_counts: dict[str, int] = {}
+    for s in scored:
+        event_counts[s.get("event_type", "General")] = event_counts.get(s.get("event_type", "General"), 0) + 1
+    bullish_w = sum(s["weight"] for s in scored if s["score"] > 15)
+    bearish_w = sum(s["weight"] for s in scored if s["score"] < -15)
+    neutral_w = sum(s["weight"] for s in scored if -15 <= s["score"] <= 15)
+    total_w = bullish_w + bearish_w + neutral_w
+    consensus = max(bullish_w, bearish_w, neutral_w) / total_w if total_w else 0.0
+    return {"score": overall, "items": sorted(scored, key=lambda z: (z["age_hours"], -z["importance"])), "catalysts": cats[:10], "risks": risks[:10], "event_counts": event_counts, "consensus": float(consensus)}
 
 
 @st.cache_data(ttl=300, max_entries=64, show_spinner=False)
@@ -916,10 +1084,15 @@ def news_radar(ticker: str) -> dict[str, Any]:
     if keys["alpha"]: tasks.append(("Alpha Vantage", lambda: alpha_news(ticker, keys["alpha"])))
     if keys["finnhub"]: tasks.append(("Finnhub", lambda: finnhub_news(ticker, keys["finnhub"])))
     if keys["marketaux"]: tasks.append(("Marketaux", lambda: marketaux_news(ticker, keys["marketaux"])))
+    if keys["fmp"]: tasks.append(("FMP", lambda: fmp_news(ticker, keys["fmp"])))
 
     items: list[dict[str, Any]] = []
     status = []
+    started = time.perf_counter()
     for name, fn in tasks:
+        if time.perf_counter() - started > 22:
+            status.append({"Provider": name, "Items": 0, "Seconds": 0.0, "Status": "SKIPPED: news time budget"})
+            continue
         name, out, err, elapsed = safe_call(name, fn)
         n = len(out) if isinstance(out, list) else 0
         status.append({"Provider": name, "Items": n, "Seconds": elapsed, "Status": "OK" if not err else err})
@@ -1080,6 +1253,83 @@ def finnhub_peers(ticker: str, api_key: str) -> list[str]:
     return [str(x).upper() for x in data[:12]] if not err and isinstance(data, list) else []
 
 
+@st.cache_data(ttl=1800, max_entries=64, show_spinner=False)
+def alpha_earnings_calendar(ticker: str, api_key: str) -> list[dict[str, Any]]:
+    if not api_key:
+        return []
+    txt, err = safe_text(
+        "https://www.alphavantage.co/query",
+        params={"function": "EARNINGS_CALENDAR", "symbol": ticker.upper(), "horizon": "3month", "apikey": api_key},
+        timeout=(3, 8),
+    )
+    if err or not txt or "symbol" not in txt.lower():
+        return []
+    try:
+        df = pd.read_csv(io.StringIO(txt))
+        return df.replace({np.nan: None}).head(8).to_dict("records")
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=1800, max_entries=64, show_spinner=False)
+def finnhub_forward_estimates(ticker: str, api_key: str) -> dict[str, Any]:
+    if not api_key:
+        return {}
+    out: dict[str, Any] = {}
+    for label, endpoint in (("eps", "eps-estimate"), ("revenue", "revenue-estimate")):
+        data, err = safe_json(
+            f"https://finnhub.io/api/v1/stock/{endpoint}",
+            params={"symbol": ticker.upper(), "freq": "quarterly", "token": api_key}, timeout=(3, 7),
+        )
+        if not err and isinstance(data, dict):
+            out[label] = data.get("data") or []
+    return out
+
+
+@st.cache_data(ttl=1800, max_entries=64, show_spinner=False)
+def fmp_fundamentals(ticker: str, api_key: str) -> dict[str, Any]:
+    if not api_key:
+        return {}
+    result: dict[str, Any] = {}
+    endpoints = {
+        "profile": ("https://financialmodelingprep.com/api/v3/profile/" + ticker.upper(), {}),
+        "growth": ("https://financialmodelingprep.com/stable/income-statement-growth", {"symbol": ticker.upper(), "limit": 5}),
+        "income": ("https://financialmodelingprep.com/api/v3/income-statement/" + ticker.upper(), {"period": "quarter", "limit": 8}),
+        "cashflow": ("https://financialmodelingprep.com/api/v3/cash-flow-statement/" + ticker.upper(), {"period": "quarter", "limit": 8}),
+    }
+    for label, (url, params) in endpoints.items():
+        p = dict(params); p["apikey"] = api_key
+        d, err = safe_json(url, params=p, timeout=(3, 7))
+        if not err and isinstance(d, list):
+            result[label] = d[:8]
+    return result
+
+
+def forward_estimate_intelligence(est: dict[str, Any]) -> dict[str, Any]:
+    eps = est.get("eps") or []
+    rev = est.get("revenue") or []
+    score = 50.0
+    detail = []
+    def _trend(rows: list[dict[str, Any]], key: str) -> float | None:
+        vals = []
+        for r in rows[:4]:
+            x = _num(r.get(key), r.get("epsAvg") if key == "epsAvg" else r.get("revenueAvg"))
+            if x is not None:
+                vals.append(x)
+        if len(vals) < 2:
+            return None
+        # Data are normally ordered by period. Compare near-term vs later-term only as a growth slope, not revision history.
+        base = abs(vals[0]) if abs(vals[0]) > 1e-9 else None
+        return None if base is None else (vals[-1] - vals[0]) / base
+    et = _trend(eps, "epsAvg")
+    rt = _trend(rev, "revenueAvg")
+    if et is not None:
+        score += float(np.clip(et * 12, -8, 8)); detail.append(f"EPS forward slope {et:+.1%}")
+    if rt is not None:
+        score += float(np.clip(rt * 10, -7, 7)); detail.append(f"Revenue forward slope {rt:+.1%}")
+    return {"score": float(np.clip(score, 30, 70)), "eps": eps[:4], "revenue": rev[:4], "notes": detail}
+
+
 def _num(*vals: Any) -> float | None:
     for v in vals:
         try:
@@ -1102,35 +1352,54 @@ def _metric_from_finnhub(bundle: dict[str, Any], *names: str) -> float | None:
 
 def build_fundamental_bundle(ticker: str, info: dict[str, Any]) -> dict[str, Any]:
     keys = api_keys()
-    alpha = alpha_overview(ticker, keys["alpha"]) if keys["alpha"] else {}
-    fin = finnhub_metrics(ticker, keys["finnhub"]) if keys["finnhub"] else {}
-    rec = finnhub_recommendations(ticker, keys["finnhub"]) if keys["finnhub"] else []
-    cal = finnhub_earnings(ticker, keys["finnhub"]) if keys["finnhub"] else []
-    pt = finnhub_price_target(ticker, keys["finnhub"]) if keys["finnhub"] else {}
-    upgrades = finnhub_upgrades(ticker, keys["finnhub"]) if keys["finnhub"] else []
-    hist = alpha_earnings_history(ticker, keys["alpha"]) if keys["alpha"] else []
+    started = time.perf_counter()
+    def allow(sec: float = 20.0) -> bool: return (time.perf_counter() - started) < sec
+    alpha = alpha_overview(ticker, keys["alpha"]) if keys["alpha"] and allow() else {}
+    fin = finnhub_metrics(ticker, keys["finnhub"]) if keys["finnhub"] and allow() else {}
+    rec = finnhub_recommendations(ticker, keys["finnhub"]) if keys["finnhub"] and allow() else []
+    cal = finnhub_earnings(ticker, keys["finnhub"]) if keys["finnhub"] and allow() else []
+    pt = finnhub_price_target(ticker, keys["finnhub"]) if keys["finnhub"] and allow() else {}
+    upgrades = finnhub_upgrades(ticker, keys["finnhub"]) if keys["finnhub"] and allow() else []
+    hist = alpha_earnings_history(ticker, keys["alpha"]) if keys["alpha"] and allow() else []
+    alpha_cal = alpha_earnings_calendar(ticker, keys["alpha"]) if keys["alpha"] and allow() else []
+    estimates = finnhub_forward_estimates(ticker, keys["finnhub"]) if keys["finnhub"] and allow() else {}
+    fmp = fmp_fundamentals(ticker, keys["fmp"]) if keys["fmp"] and allow() else {}
+
+    fp = (fmp.get("profile") or [{}])[0] if isinstance(fmp, dict) else {}
+    fg = (fmp.get("growth") or [{}])[0] if isinstance(fmp, dict) else {}
+    fi = (fmp.get("income") or [{}])[0] if isinstance(fmp, dict) else {}
+    fc = (fmp.get("cashflow") or [{}])[0] if isinstance(fmp, dict) else {}
+    fmp_gross_margin = None
+    fmp_oper_margin = None
+    try:
+        if _num(fi.get("revenue")) and _num(fi.get("grossProfit")) is not None:
+            fmp_gross_margin = float(fi.get("grossProfit")) / float(fi.get("revenue"))
+        if _num(fi.get("revenue")) and _num(fi.get("operatingIncome")) is not None:
+            fmp_oper_margin = float(fi.get("operatingIncome")) / float(fi.get("revenue"))
+    except Exception:
+        pass
 
     metrics = {
-        "market_cap": _num(info.get("marketCap"), alpha.get("MarketCapitalization")),
+        "market_cap": _num(info.get("marketCap"), alpha.get("MarketCapitalization"), fp.get("mktCap"), fp.get("marketCap")),
         "enterprise_value": _num(info.get("enterpriseValue")),
-        "revenue_growth": _num(info.get("revenueGrowth"), alpha.get("QuarterlyRevenueGrowthYOY")),
-        "earnings_growth": _num(info.get("earningsGrowth"), info.get("earningsQuarterlyGrowth"), alpha.get("QuarterlyEarningsGrowthYOY")),
-        "gross_margin": _num(info.get("grossMargins"), alpha.get("GrossProfitTTM") and None),
-        "operating_margin": _num(info.get("operatingMargins"), alpha.get("OperatingMarginTTM")),
+        "revenue_growth": _num(info.get("revenueGrowth"), alpha.get("QuarterlyRevenueGrowthYOY"), fg.get("growthRevenue")),
+        "earnings_growth": _num(info.get("earningsGrowth"), info.get("earningsQuarterlyGrowth"), alpha.get("QuarterlyEarningsGrowthYOY"), fg.get("growthEPS"), fg.get("growthNetIncome")),
+        "gross_margin": _num(info.get("grossMargins"), fmp_gross_margin),
+        "operating_margin": _num(info.get("operatingMargins"), alpha.get("OperatingMarginTTM"), fmp_oper_margin),
         "profit_margin": _num(info.get("profitMargins"), alpha.get("ProfitMargin")),
         "forward_pe": _num(info.get("forwardPE"), alpha.get("ForwardPE"), _metric_from_finnhub(fin, "peExclExtraAnnual")),
         "trailing_pe": _num(info.get("trailingPE"), alpha.get("PERatio"), _metric_from_finnhub(fin, "peTTM", "peBasicExclExtraTTM")),
         "price_to_sales": _num(info.get("priceToSalesTrailing12Months"), alpha.get("PriceToSalesRatioTTM"), _metric_from_finnhub(fin, "psTTM")),
         "price_to_book": _num(info.get("priceToBook"), alpha.get("PriceToBookRatio"), _metric_from_finnhub(fin, "pbQuarterly")),
         "ev_to_ebitda": _num(info.get("enterpriseToEbitda"), alpha.get("EVToEBITDA"), _metric_from_finnhub(fin, "evEbitdaTTM")),
-        "free_cash_flow": _num(info.get("freeCashflow")),
-        "operating_cash_flow": _num(info.get("operatingCashflow")),
+        "free_cash_flow": _num(info.get("freeCashflow"), fc.get("freeCashFlow")),
+        "operating_cash_flow": _num(info.get("operatingCashflow"), fc.get("operatingCashFlow"), fc.get("netCashProvidedByOperatingActivities")),
         "total_cash": _num(info.get("totalCash")),
         "total_debt": _num(info.get("totalDebt")),
         "shares": _num(info.get("sharesOutstanding")),
         "forward_eps": _num(info.get("forwardEps")),
         "trailing_eps": _num(info.get("trailingEps"), alpha.get("EPS")),
-        "beta": _num(info.get("beta"), alpha.get("Beta"), 1.0),
+        "beta": _num(info.get("beta"), alpha.get("Beta"), fp.get("beta"), 1.0),
         "roe": _num(info.get("returnOnEquity"), alpha.get("ReturnOnEquityTTM"), _metric_from_finnhub(fin, "roeTTM")),
         "roa": _num(info.get("returnOnAssets"), alpha.get("ReturnOnAssetsTTM"), _metric_from_finnhub(fin, "roaTTM")),
         "analyst_target_mean": _num(pt.get("targetMean"), info.get("targetMeanPrice"), alpha.get("AnalystTargetPrice")),
@@ -1139,7 +1408,7 @@ def build_fundamental_bundle(ticker: str, info: dict[str, Any]) -> dict[str, Any
         "analyst_target_low": _num(pt.get("targetLow"), info.get("targetLowPrice")),
         "analyst_count": _num(pt.get("numberAnalysts"), info.get("numberOfAnalystOpinions")),
     }
-    return {"metrics": metrics, "alpha": alpha, "finnhub": fin, "recommendations": rec, "price_target": pt, "upgrades": upgrades, "earnings_calendar": cal, "earnings_history": hist}
+    return {"metrics": metrics, "alpha": alpha, "finnhub": fin, "recommendations": rec, "price_target": pt, "upgrades": upgrades, "earnings_calendar": cal, "alpha_earnings_calendar": alpha_cal, "earnings_history": hist, "forward_estimates": estimates, "fmp": fmp}
 
 
 def earnings_intelligence(bundle: dict[str, Any]) -> dict[str, Any]:
@@ -1279,9 +1548,10 @@ SEC filings, analyst upgrades/downgrades/price-target changes, material legal/re
 product/customer/AI demand developments, and macro/sector events directly relevant to the stock.
 Distinguish confirmed facts from rumor. Return a concise Chinese brief with: Latest confirmed events,
 Bullish catalysts, Bearish risks, Earnings/valuation implications, and What could invalidate the view.
-Use source links/citations when available. Do not make a guaranteed price prediction."""
+Use source links/citations when available. Do not make a guaranteed price prediction.
+At the end append one compact JSON object with keys: event_score (-100..100), event_confidence (0..100), catalysts (array), risks (array), invalidation (array)."""
     payload = {
-        "model": model or "gpt-5",
+        "model": model or "gpt-5.6-sol",
         "tools": [{"type": "web_search"}],
         "input": prompt,
         "max_output_tokens": 1400,
@@ -1305,7 +1575,15 @@ Use source links/citations when available. Do not make a guaranteed price predic
                 if c.get("type") == "output_text" and c.get("text"):
                     texts.append(str(c["text"]))
         text = "\n".join(texts).strip()
-        return {"text": text, "model": model or "gpt-5", "response_id": data.get("id")} if text else {"error": "OpenAI returned no text."}
+        parsed = None
+        try:
+            m = re.search(r"\{.*\}", text, re.S)
+            if m: parsed = json.loads(m.group(0))
+        except Exception:
+            parsed = None
+        out = {"text": text, "model": model or "gpt-5.6-sol", "response_id": data.get("id")}
+        if isinstance(parsed, dict): out["structured"] = parsed
+        return out if text else {"error": "OpenAI returned no text."}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -1349,6 +1627,52 @@ def fred_latest(api_key: str) -> list[dict[str, Any]]:
     return out
 
 
+SECTOR_ETFS = ("XLK", "XLF", "XLY", "XLC", "XLI", "XLE", "XLV", "XLP", "XLU", "XLRE", "XLB", "SMH")
+
+
+@st.cache_data(ttl=900, max_entries=8, show_spinner=False)
+def market_breadth_snapshot() -> dict[str, Any]:
+    ds = yf_multi_daily(SECTOR_ETFS, "6mo")
+    rows = []
+    for t in SECTOR_ETFS:
+        d = ds.get(t, pd.DataFrame())
+        if len(d) < 25:
+            continue
+        r5 = float(d.Close.pct_change(5).iloc[-1]); r20 = float(d.Close.pct_change(20).iloc[-1])
+        rows.append({"ETF": t, "5D": r5, "20D": r20, "Above20D": bool(float(d.Close.iloc[-1]) > float(d.Close.rolling(20).mean().iloc[-1]))})
+    if not rows:
+        return {"score": 50.0, "rows": []}
+    positive = np.mean([r["20D"] > 0 for r in rows])
+    above = np.mean([r["Above20D"] for r in rows])
+    score = float(np.clip(30 + positive * 35 + above * 35, 15, 85))
+    return {"score": score, "rows": sorted(rows, key=lambda x: x["20D"], reverse=True)}
+
+
+@st.cache_data(ttl=1800, max_entries=64, show_spinner=False)
+def peer_relative_strength(ticker: str, finnhub_key: str) -> dict[str, Any]:
+    if not finnhub_key:
+        return {}
+    peers = [p for p in finnhub_peers(ticker, finnhub_key) if p != ticker.upper()][:8]
+    universe = tuple(dict.fromkeys([ticker.upper()] + peers))
+    if len(universe) < 3:
+        return {}
+    ds = yf_multi_daily(universe, "6mo")
+    rows = []
+    for t in universe:
+        d = ds.get(t, pd.DataFrame())
+        if len(d) < 25:
+            continue
+        rows.append({"Ticker": t, "5D": float(d.Close.pct_change(5).iloc[-1]), "20D": float(d.Close.pct_change(20).iloc[-1]), "60D": float(d.Close.pct_change(60).iloc[-1]) if len(d) > 61 else np.nan})
+    if not rows:
+        return {}
+    vals = [r["20D"] for r in rows]
+    target = next((r for r in rows if r["Ticker"] == ticker.upper()), None)
+    if not target:
+        return {}
+    pct = float(np.mean(np.asarray(vals) <= target["20D"]))
+    return {"percentile": pct, "score": float(np.clip(25 + pct * 50, 25, 75)), "rows": sorted(rows, key=lambda x: x["20D"], reverse=True)}
+
+
 @st.cache_data(ttl=600, max_entries=16, show_spinner=False)
 def macro_snapshot() -> dict[str, Any]:
     tickers = ("SPY", "QQQ", "IWM", "SMH", "^VIX", "^TNX", "DX-Y.NYB", "CL=F")
@@ -1372,8 +1696,10 @@ def macro_snapshot() -> dict[str, Any]:
     dxy20 = mp.get("DX-Y.NYB", {}).get("20D", 0)
     score += float(np.clip(-dxy20 * 50, -3, 3))
     fred = fred_latest(api_keys()["fred"])
+    breadth = market_breadth_snapshot()
+    score = score * 0.82 + float(breadth.get("score", 50)) * 0.18
     regime = "Risk-on" if score >= 58 else ("Risk-off" if score <= 42 else "Mixed")
-    return {"score": float(np.clip(score, 0, 100)), "rows": rows, "fred": fred, "regime": regime}
+    return {"score": float(np.clip(score, 0, 100)), "rows": rows, "fred": fred, "regime": regime, "breadth": breadth}
 
 
 # -----------------------------------------------------------------------------
@@ -1625,9 +1951,33 @@ def _quality_score(raw_rows: int, news_count: int, provider_count: int, has_info
     return float(np.clip(q, 20, 100))
 
 
-@st.cache_data(ttl=600, max_entries=48, show_spinner=False)
+def probability_grade(confidence: float, quality: float, model_auc: float, dispersion: float) -> str:
+    s = 0.35 * confidence + 0.35 * quality + 30 * np.clip((model_auc - 0.5) / 0.2, 0, 1) - dispersion * 35
+    if s >= 82: return "A"
+    if s >= 72: return "B+"
+    if s >= 62: return "B"
+    if s >= 52: return "C+"
+    return "C"
+
+
+def scenario_probabilities(p5: float, risk: float) -> dict[str, float]:
+    directional = np.clip(abs(p5 - 0.5) * 2, 0, 1)
+    tail = np.clip(0.12 + risk / 35, 0.14, 0.38)
+    if p5 >= 0.5:
+        bull = 0.27 + 0.36 * directional
+        bear = tail * (1 - 0.45 * directional)
+    else:
+        bear = 0.27 + 0.36 * directional
+        bull = tail * (1 - 0.45 * directional)
+    base = max(0.10, 1 - bull - bear)
+    z = bull + base + bear
+    return {"bull": float(bull/z), "base": float(base/z), "bear": float(bear/z)}
+
+
+@st.cache_data(ttl=300, max_entries=40, show_spinner=False)
 def analyze_max(ticker: str, include_options: bool = False, include_ai_web: bool = False) -> dict[str, Any]:
     ticker = ticker.upper().strip()
+    budget = ExecutionBudget(seconds=float(_secret("MAX_ANALYSIS_SECONDS", "72") or 72))
     if not re.fullmatch(r"[A-Z0-9.\-]{1,10}", ticker):
         raise ValueError("股票代码格式不正确。")
 
@@ -1663,9 +2013,15 @@ def analyze_max(ticker: str, include_options: bool = False, include_ai_web: bool
     fund, fund_notes, fund_fields = fundamental_score(info)
     fund_bundle = build_fundamental_bundle(ticker, info)
     earn_intel = earnings_intelligence(fund_bundle)
+    estimate_intel = forward_estimate_intelligence(fund_bundle.get("forward_estimates") or {})
     spot_for_value = _num(snap.get("price"), float(ind["Close"].iloc[-1])) or float(ind["Close"].iloc[-1])
     analyst_intel = analyst_intelligence(fund_bundle, spot_for_value)
     valuation = valuation_engine(spot_for_value, fund_bundle, macro)
+    peer = {}
+    if api_keys()["finnhub"] and budget.allow(14):
+        _, peer, peer_err, peer_elapsed = safe_call("peer_strength", lambda: peer_relative_strength(ticker, api_keys()["finnhub"]))
+        health.append({"Module": "peer_strength", "Seconds": peer_elapsed, "Status": "OK" if not peer_err else peer_err})
+        peer = peer or {}
     news01 = float(np.clip(50 + news.get("score", 0) * 0.38, 0, 100))
     macro01 = float(macro.get("score", 50))
     intra01 = float(intra.get("score", 50))
@@ -1678,15 +2034,30 @@ def analyze_max(ticker: str, include_options: bool = False, include_ai_web: bool
             earn_intel.get("score", 50) / 100, analyst_intel.get("score", 50) / 100,
             valuation.get("score", 50) / 100,
         )
-        fused[h] = p
+        # Small institutional overlays only when data are actually present. They are bounded to avoid overfitting.
+        est_adj = (float(estimate_intel.get("score", 50)) - 50) / 1000.0
+        peer_adj = (float(peer.get("score", 50)) - 50) / 1200.0 if peer else 0.0
+        regime = str(macro.get("regime", "Mixed"))
+        regime_adj = 0.0
+        if regime == "Risk-off" and p > 0.5: regime_adj = -0.012 if h <= 3 else -0.008
+        if regime == "Risk-on" and p < 0.5: regime_adj = 0.008 if h <= 3 else 0.005
+        fused[h] = float(np.clip(p + est_adj + peer_adj + regime_adj, 0.05, 0.95))
 
     dispersion = float(np.mean([hres[h].dispersion for h in (1, 3, 5) if hres.get(h)])) if any(hres.get(h) for h in (1, 3, 5)) else 0.18
     quality = _quality_score(len(ind), news.get("article_count", 0), news.get("provider_count", 0), bool(info), intra, hres)
     if fund_bundle.get("alpha"): quality += 3
     if fund_bundle.get("finnhub"): quality += 3
+    if fund_bundle.get("fmp"): quality += 3
+    if macro.get("breadth", {}).get("rows"): quality += 2
+    if peer: quality += 2
     quality = float(np.clip(quality, 20, 100))
     model_quality = float(np.mean([hres[h].ensemble_metrics.get("auc", 0.5) for h in (1, 3, 5) if hres.get(h)])) if any(hres.get(h) for h in (1, 3, 5)) else 0.5
-    confidence = 50 + (quality - 60) * 0.35 + (model_quality - 0.5) * 70 - dispersion * 95
+    news_consensus = float(news.get("consensus", 0.0) or 0.0)
+    confidence = 50 + (quality - 60) * 0.35 + (model_quality - 0.5) * 70 - dispersion * 95 + max(0.0, news_consensus - 0.45) * 12
+    quote_age_pre = timestamp_age_seconds(snap.get("updated"))
+    if market_session_status() != "Closed" and quote_age_pre is not None:
+        if quote_age_pre > 3600: confidence -= 12
+        elif quote_age_pre > 900: confidence -= 7
     confidence = float(np.clip(confidence, 25, 92))
 
     # Reliability shrinkage: lower confidence means the displayed probability moves toward 50%.
@@ -1703,11 +2074,20 @@ def analyze_max(ticker: str, include_options: bool = False, include_ai_web: bool
 
     close = ind["Close"].dropna()
     ranges = {h: range_stats(close, h) for h in (1, 3, 5)}
-    opt = options_snapshot(ticker) if include_options else {}
+    opt = options_snapshot(ticker) if include_options and budget.allow(12) else {}
+    if include_options and not opt and not budget.allow(12):
+        health.append({"Module": "options", "Seconds": 0.0, "Status": "SKIPPED: execution budget protection"})
     ai_web = {}
-    if include_ai_web and api_keys()["openai"]:
+    if include_ai_web and api_keys()["openai"] and budget.allow(28):
         _, ai_web, ai_err, ai_elapsed = safe_call("openai_web", lambda: openai_web_brief(ticker, api_keys()["openai"], api_keys()["openai_model"]))
         health.append({"Module": "openai_web", "Seconds": ai_elapsed, "Status": "OK" if not ai_err and not (isinstance(ai_web, dict) and ai_web.get("error")) else (ai_err or ai_web.get("error"))})
+    elif include_ai_web and api_keys()["openai"]:
+        health.append({"Module": "openai_web", "Seconds": 0.0, "Status": "SKIPPED: execution budget protection"})
+    model_auc = float(model_quality)
+    grade = probability_grade(confidence, quality, model_auc, dispersion)
+    scenarios = scenario_probabilities(fused[5], risk)
+    quote_age = timestamp_age_seconds(snap.get("updated"))
+    freshness = 100.0 if quote_age is not None and quote_age < 60 else (80.0 if quote_age is not None and quote_age < 900 else 55.0)
     return {
         "ticker": ticker, "version": APP_VERSION, "generated_at": datetime.now(UTC).isoformat(),
         "snapshot": snap, "ind": ind, "feature_meta": feature_meta, "intraday": intra, "news": news,
@@ -1717,6 +2097,8 @@ def analyze_max(ticker: str, include_options: bool = False, include_ai_web: bool
         "tech": tech, "tech_notes": tech_notes, "fund": fund, "fund_notes": fund_notes,
         "news01": news01, "macro01": macro01, "confidence": confidence, "data_quality": quality,
         "risk": risk, "ranges": ranges, "options": opt, "ai_web": ai_web, "health": health,
+        "estimate_intel": estimate_intel, "peer": peer, "probability_grade": grade, "scenarios": scenarios,
+        "freshness_score": freshness, "analysis_seconds": budget.elapsed,
     }
 
 
@@ -1809,6 +2191,7 @@ def render_source_badges() -> None:
     if k["alpha"]: active.append("Alpha Vantage")
     if k["finnhub"]: active.append("Finnhub")
     if k["marketaux"]: active.append("Marketaux")
+    if k["fmp"]: active.append("FMP")
     if k["fred"]: active.append("FRED")
     if k["openai"]: active.append("OpenAI Web")
     st.markdown(" ".join([f'<span class="pill">{x}</span>' for x in active]), unsafe_allow_html=True)
@@ -1816,7 +2199,7 @@ def render_source_badges() -> None:
 
 def render_live_quote_fragment(ticker: str) -> None:
     """Lightweight auto-refresh. It never retrains models or reruns the full analysis."""
-    @st.fragment(run_every="30s")
+    @st.fragment(run_every="20s")
     def _live() -> None:
         q = current_snapshot(ticker)
         if not q:
@@ -1830,7 +2213,7 @@ def render_live_quote_fragment(ticker: str) -> None:
         cols[2].metric("Ask", fmt_money(q.get("ask")))
         cols[3].metric("Volume", f"{int(q.get('volume')):,}" if _num(q.get('volume')) is not None else "—")
         cols[4].metric("Feed", q.get("source", "—"))
-        st.caption(f"Auto refresh 30s · {age_txt} · exchange entitlement/delay depends on provider plan")
+        st.caption(f"Auto refresh 20s · {age_txt} · exchange entitlement/delay depends on provider plan")
     _live()
 
 
@@ -1849,7 +2232,13 @@ def render_result(r: dict[str, Any]) -> None:
     top[5].metric("Risk", f"{r['risk']:.1f}/10")
     top[6].metric("Data Quality", f"{r['data_quality']:.0f}/100")
     top[7].metric("Session", market_session_status())
-    st.caption(f"Quote source: {snap.get('source','Unavailable')} · Generated: {r['generated_at'][:19]} UTC · Probability is calibrated/shrunk when confidence is low.")
+    st.caption(f"Quote source: {snap.get('source','Unavailable')} · Generated: {r['generated_at'][:19]} UTC · Reliability grade: {r.get('probability_grade','—')} · Freshness: {r.get('freshness_score',0):.0f}/100 · Analysis: {r.get('analysis_seconds',0):.1f}s")
+    sc = r.get("scenarios") or {}
+    if sc:
+        scc = st.columns(3)
+        scc[0].metric("Bull Case", f"{sc.get('bull',0):.1%}")
+        scc[1].metric("Base Case", f"{sc.get('base',0):.1%}")
+        scc[2].metric("Bear Case", f"{sc.get('bear',0):.1%}")
 
     c1, c2, c3 = st.columns([2.0, 1.0, 1.0])
     with c1:
@@ -1908,7 +2297,9 @@ def render_result(r: dict[str, Any]) -> None:
             st.dataframe(pd.DataFrame(rows).style.format({"Latest Up": "{:.1%}", "Accuracy": "{:.1%}", "ROC AUC": "{:.3f}", "Brier": "{:.3f}", "Weight": "{:.2f}"}, na_rep="—"), use_container_width=True, hide_index=True)
         st.caption("Metrics use a chronological holdout. Latest probabilities are calibrated when validation data allow it, then the final display is shrunk toward 50% when confidence/data quality are weak.")
     with tabs[2]:
-        st.write(f"News score: **{r['news'].get('score',0):+.1f}/100** · Unique items: **{r['news'].get('article_count',0)}** · Active news/filing providers: **{r['news'].get('provider_count',0)}**")
+        st.write(f"News score: **{r['news'].get('score',0):+.1f}/100** · Unique items: **{r['news'].get('article_count',0)}** · Active providers: **{r['news'].get('provider_count',0)}** · Direction consensus: **{r['news'].get('consensus',0):.0%}**")
+        if r["news"].get("event_counts"):
+            st.caption("Event mix: " + " · ".join(f"{k}:{v}" for k,v in sorted(r["news"]["event_counts"].items(), key=lambda z:-z[1])[:6]))
         if r["news"].get("provider_status"):
             st.dataframe(pd.DataFrame(r["news"]["provider_status"]), use_container_width=True, hide_index=True)
         for n in r["news"].get("items", [])[:35]:
@@ -1916,12 +2307,16 @@ def render_result(r: dict[str, Any]) -> None:
             title = n.get("title", "")
             url = n.get("url", "")
             head = f"[{title}]({url})" if url else title
-            st.markdown(f"**{label} · {n.get('score',0):+.0f} · Imp {n.get('importance',0):.0f}/10** — {head}")
-            st.caption(f"{n.get('provider','')} · age ~{n.get('age_hours',0):.1f}h")
+            st.markdown(f"**{label} · {n.get('score',0):+.0f} · Imp {n.get('importance',0):.0f}/10 · {n.get('event_type','General')}** — {head}")
+            st.caption(f"{n.get('provider','')} · age ~{n.get('age_hours',0):.1f}h · source reliability {n.get('source_reliability',1.0):.2f}x")
     with tabs[3]:
         st.write(f"Regime: **{r['macro'].get('regime','Unknown')}** · Macro score **{r['macro01']:.0f}/100**")
         if r["macro"].get("rows"):
             st.dataframe(pd.DataFrame(r["macro"]["rows"]).style.format({"Last": "{:.2f}", "1D": "{:.2%}", "5D": "{:.2%}", "20D": "{:.2%}"}), use_container_width=True, hide_index=True)
+        if r["macro"].get("breadth", {}).get("rows"):
+            st.markdown("**US sector breadth / rotation**")
+            st.metric("Breadth Score", f"{r['macro']['breadth'].get('score',50):.0f}/100")
+            st.dataframe(pd.DataFrame(r["macro"]["breadth"]["rows"]), use_container_width=True, hide_index=True)
         if r["macro"].get("fred"):
             st.markdown("**Official FRED series**")
             st.dataframe(pd.DataFrame(r["macro"]["fred"]), use_container_width=True, hide_index=True)
@@ -1977,6 +2372,23 @@ def render_result(r: dict[str, Any]) -> None:
             st.markdown("**Analyst price targets (Finnhub)**"); st.json(fb["price_target"])
         if fb.get("upgrades"):
             st.markdown("**Recent upgrades/downgrades (Finnhub; plan-dependent)**"); st.dataframe(pd.DataFrame(fb["upgrades"][:10]), use_container_width=True, hide_index=True)
+        est = r.get("estimate_intel") or {}
+        if est.get("eps") or est.get("revenue"):
+            st.markdown("**Forward analyst estimates (Finnhub)**")
+            st.metric("Forward estimate score", f"{est.get('score',50):.0f}/100")
+            if est.get("eps"): st.dataframe(pd.DataFrame(est["eps"]), use_container_width=True, hide_index=True)
+            if est.get("revenue"): st.dataframe(pd.DataFrame(est["revenue"]), use_container_width=True, hide_index=True)
+        peer = r.get("peer") or {}
+        if peer.get("rows"):
+            st.markdown("**Peer relative strength**")
+            st.metric("20D Peer Percentile", f"{peer.get('percentile',0):.0%}")
+            st.dataframe(pd.DataFrame(peer["rows"]), use_container_width=True, hide_index=True)
+        if fb.get("alpha_earnings_calendar"):
+            st.markdown("**Upcoming earnings (Alpha Vantage)**")
+            st.dataframe(pd.DataFrame(fb["alpha_earnings_calendar"]), use_container_width=True, hide_index=True)
+        if fb.get("fmp"):
+            st.markdown("**FMP supplemental fundamentals**")
+            st.caption("Additional financial statement/profile coverage loaded; values are used as corroborating context, not blindly overriding primary fields.")
     with tabs[7]:
         ai = r.get("ai_web") or {}
         if ai.get("text"):
@@ -1991,7 +2403,7 @@ def render_result(r: dict[str, Any]) -> None:
     with tabs[8]:
         st.markdown("**Module health / latency**")
         st.dataframe(pd.DataFrame(r["health"]), use_container_width=True, hide_index=True)
-        st.write("Protection enabled: per-provider timeouts · bounded retries · sequential heavy modules · ML n_jobs=1 · 30s quote fragment only · bounded news/MC/history sizes · cache TTL · no training on page load · failures isolated · top-level crash screen · streamlit_app.py safe wrapper.")
+        st.write("Protection enabled: per-provider timeouts · bounded retries · 22s news-source budget · ~20s supplemental fundamentals budget · total soft execution budget · ML n_jobs=1 · 20s quote fragment only · bounded news/MC/history sizes · cache TTL · no training on page load · failures isolated · top-level crash screen · streamlit_app.py safe wrapper.")
         opt = r.get("options") or {}
         if opt:
             st.markdown("**Options snapshot**")
@@ -2011,8 +2423,8 @@ def render_result(r: dict[str, Any]) -> None:
 
 def render_sidebar() -> str:
     with st.sidebar:
-        st.title("📈 Stock AI MAX ULTRA X")
-        st.caption(f"v{APP_VERSION} · Institutional Cloud-Safe")
+        st.title("📈 Stock AI MAX INSTITUTIONAL")
+        st.caption(f"v{APP_VERSION} · Institutional FINAL · Cloud-Safe")
         page = st.radio("功能", ["🚀 MAX 分析", "🛰️ 实时新闻雷达", "⏱ 盘中信号", "🎯 目标价概率", "🏆 Scanner", "🧪 回测", "🔌 数据源"], index=0)
         st.divider()
         st.write("**当前可用数据源**")
@@ -2029,11 +2441,11 @@ def page_analysis() -> None:
     ticker = a.text_input("股票代码", "NVDA", key="main_ticker").upper().strip()
     include_options = b.toggle("Options", value=False, help="较慢，默认关闭保护云端。")
     include_ai_web = c.toggle("AI Web 最新情报", value=False, help="需要 OPENAI_API_KEY；会额外搜索最新网页信息，较慢且有 API 成本。")
-    run = d.button("🚀 开始 ULTRA X", type="primary", use_container_width=True)
+    run = d.button("🚀 开始 INSTITUTIONAL", type="primary", use_container_width=True)
     st.markdown("**实时价格脉冲（不重训模型）**")
     render_live_quote_fragment(ticker)
     if run:
-        with st.status("MAX ULTRA 正在分析…", expanded=True) as status:
+        with st.status("INSTITUTIONAL 正在分析…", expanded=True) as status:
             try:
                 st.write("① 构建 3 年日线 + SPY/QQQ/SMH/VIX/10Y 市场特征")
                 r = analyze_max(ticker, include_options, include_ai_web)
@@ -2153,6 +2565,7 @@ def page_sources() -> None:
         {"Source": "Alpha Vantage", "Configured": "Yes" if k["alpha"] else "No", "Use": "News + native ticker sentiment"},
         {"Source": "Finnhub", "Configured": "Yes" if k["finnhub"] else "No", "Use": "Quote, company news, analyst trends, earnings calendar"},
         {"Source": "Marketaux", "Configured": "Yes" if k["marketaux"] else "No", "Use": "Broad multi-source financial news + entity sentiment"},
+        {"Source": "FMP", "Configured": "Yes" if k["fmp"] else "No", "Use": "Supplemental news + statements/profile corroboration"},
         {"Source": "FRED", "Configured": "Yes" if k["fred"] else "No", "Use": "Official CPI/PPI/NFP/UNRATE/Fed Funds/2Y/10Y"},
         {"Source": "OpenAI Web", "Configured": "Yes" if k["openai"] else "No", "Use": "Optional fresh web intelligence / event verification"},
     ]
@@ -2162,9 +2575,11 @@ def page_sources() -> None:
 ALPHA_VANTAGE_API_KEY = ""
 FINNHUB_API_KEY = ""
 MARKETAUX_API_KEY = ""
+FMP_API_KEY = ""
 FRED_API_KEY = ""
 OPENAI_API_KEY = ""
-OPENAI_MODEL = "gpt-5"
+OPENAI_MODEL = "gpt-5.6-sol"
+MAX_ANALYSIS_SECONDS = "72"
 SEC_USER_AGENT = "Your Name your-email@example.com"''',
         language="toml",
     )
@@ -2174,8 +2589,8 @@ SEC_USER_AGENT = "Your Name your-email@example.com"''',
 
 def main() -> None:
     st.markdown(
-        '<div class="hero"><h2 style="margin:0">Stock AI MAX ULTRA X · 实时事件驱动 + 估值 + 概率校准</h2>'
-        '<div class="small">实时/盘中 + 技术/ML + 多来源新闻/SEC + 财报/机构 + 宏观 + 多模型校准 + DCF/FCF/PE估值 + Monte Carlo + AI Web（可选）</div></div>',
+        '<div class="hero"><h2 style="margin:0">Stock AI MAX · INSTITUTIONAL FINAL · 实时事件驱动 + 机构预期 + 概率校准</h2>'
+        '<div class="small">实时/盘中 + 多源新闻/SEC/FMP + 财报/机构预期 + 市场广度/同行强弱 + 校准ML + 多方法估值 + Monte Carlo + AI Web核验（可选）</div></div>',
         unsafe_allow_html=True,
     )
     page = render_sidebar()

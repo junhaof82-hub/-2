@@ -1,26 +1,29 @@
-# Stock AI MAX ULTRA X v4.0 Test Report
+# Test Report — Stock AI MAX INSTITUTIONAL FINAL
 
-## Completed
+Build date: 2026-09-06
 
-- `app.py` Python syntax compile: PASS
-- `streamlit_app.py` Python syntax compile: PASS
-- Valuation engine pure-function test: PASS
-- Positive-FCF DCF/FCF-yield/PE multi-method case: PASS
-- Negative-FCF fallback valuation case: PASS
-- Earnings surprise scoring test: PASS
-- Analyst recommendation scoring test: PASS
-- No API keys embedded: PASS
-- Cloud-safe wrapper uses `runpy.run_path(..., run_name="__main__")`: PASS
+Checks completed in the build environment:
 
-## Design checks
+- `app.py` Python bytecode compilation: PASS
+- `streamlit_app.py` Python bytecode compilation: PASS
+- Full AST parse: PASS
+- Event taxonomy tests: PASS
+- Bull/Base/Bear probability normalization: PASS
+- Reliability grade calculation: PASS
+- Forward-estimate intelligence calculation: PASS
+- Dependency set intentionally kept lightweight: Streamlit, yfinance, pandas, numpy, plotly, scikit-learn, requests, urllib3
 
-- Heavy model training is not executed on initial page load.
-- Live auto refresh is isolated to a lightweight 30-second Streamlit fragment.
-- OpenAI Web and Options are user-triggered, not automatic.
-- Network providers are timeout/retry bounded and failure-isolated.
-- ML tree models remain single-threaded (`n_jobs=1`).
-- Top-level exception handler renders diagnostic UI instead of intentional blank output.
+Cloud-safety design checks:
 
-## Environment note
+- No XGBoost / LightGBM / PyTorch / TensorFlow runtime dependency
+- ML tree models use `n_jobs=1`
+- BLAS thread caps are set before NumPy/sklearn import
+- News source time budget included
+- Supplemental fundamentals time budget included
+- Total soft execution budget included
+- Optional Options and AI Web run only on user request and only when budget remains
+- Quote auto-refresh is isolated in a Streamlit fragment and does not retrain ML
+- Top-level exception shield included
+- Safe `streamlit_app.py` wrapper included
 
-The artifact build container used for this patch did not have Streamlit/yfinance installed, so a live Streamlit server launch was not performed here. The app and wrapper compiled successfully, and the new pure calculation modules were executed directly. Streamlit Cloud installs the pinned dependencies from `requirements.txt` during deployment.
+Limit: the build container does not have Streamlit/yfinance installed and has restricted package/network access, so an actual Community Cloud server boot could not be reproduced locally here. The code was compiled and pure computation components were tested. The target deployment installs dependencies from `requirements.txt`.
