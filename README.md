@@ -1,8 +1,15 @@
-# pytest cache directory #
+# Stock AI MAX Cloud — Single File
 
-This directory contains data from the pytest's cache plugin,
-which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+This build is designed specifically for GitHub web upload + Streamlit Community Cloud.
 
-**Do not** commit this to version control.
+Upload ONLY these two required files to the ROOT of the GitHub repository:
+- `app.py`
+- `requirements.txt`
 
-See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+Then deploy with:
+- Branch: `main`
+- Main file path: `app.py`
+
+Optional: upload `README.md` too.
+
+No package folders are required, so GitHub web upload cannot flatten/break the imports.

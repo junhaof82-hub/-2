@@ -1,329 +1,441 @@
 from __future__ import annotations
 
 import os
-os.environ.setdefault('OMP_NUM_THREADS','1')
-os.environ.setdefault('OPENBLAS_NUM_THREADS','1')
-os.environ.setdefault('MKL_NUM_THREADS','1')
-os.environ.setdefault('NUMEXPR_NUM_THREADS','1')
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-import json
 import math
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
+import yfinance as yf
+from sklearn.base import clone
+from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-from config import settings
-from data.market_data import MarketDataService
-from data.news import NewsService
-from features.sentiment import NewsSentimentAnalyzer
-from features.technical import add_technical_indicators
-from prediction.pro_engine import ProAnalysisEngine
-from prediction.ranking import scan
-from backtest.backtest import run_backtest
-from backtest.walk_forward import run_walk_forward
-from storage.database import Database
+st.set_page_config(page_title="Stock AI MAX Cloud", page_icon="📈", layout="wide")
 
-st.set_page_config(page_title='Stock AI MAX', page_icon='📈', layout='wide', initial_sidebar_state='expanded')
-st.markdown('''
+st.markdown("""
 <style>
-.block-container {padding-top:1rem; padding-bottom:3rem; max-width:1540px;}
-[data-testid="stMetricValue"] {font-size:1.55rem;}
-.hero {padding:18px 21px; border:1px solid rgba(128,128,128,.25); border-radius:18px; margin-bottom:14px;}
-.badge {display:inline-block; padding:3px 9px; margin:2px 3px; border:1px solid rgba(128,128,128,.28); border-radius:999px; font-size:.82rem;}
-.note {opacity:.72; font-size:.88rem;}
+.block-container{padding-top:1.1rem;max-width:1500px}
+.hero{padding:18px 22px;border:1px solid rgba(128,128,128,.25);border-radius:18px;margin-bottom:14px}
+.small{font-size:.86rem;opacity:.72}.pill{display:inline-block;padding:3px 9px;border:1px solid rgba(128,128,128,.3);border-radius:999px;margin:2px}
+[data-testid="stMetricValue"]{font-size:1.55rem}
 </style>
-''', unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
+# ---------------------------- data helpers ----------------------------
 
-def fmt_money(v):
-    try:
-        if v is None or not math.isfinite(float(v)): return '—'
-        return f'${float(v):,.2f}'
-    except Exception: return '—'
-
-
-def fmt_pct(v, digits=1, already_pct=False):
-    try:
-        if v is None or not math.isfinite(float(v)): return '—'
-        x = float(v) if already_pct else float(v)*100
-        return f'{x:.{digits}f}%'
-    except Exception: return '—'
-
-
-def fmt_big(v):
-    try:
-        x = float(v)
-        if not math.isfinite(x): return '—'
-        if abs(x)>=1e12: return f'${x/1e12:.2f}T'
-        if abs(x)>=1e9: return f'${x/1e9:.2f}B'
-        if abs(x)>=1e6: return f'${x/1e6:.2f}M'
-        return f'${x:,.0f}'
-    except Exception: return '—'
-
-
-def prob_label(p):
-    p=float(p)
-    if p>=.65: return '明显偏多'
-    if p>=.56: return '轻度偏多'
-    if p<=.35: return '明显偏空'
-    if p<=.44: return '轻度偏空'
-    return '中性'
-
-
-@st.cache_resource
-def get_engine(): return ProAnalysisEngine()
-
-@st.cache_resource
-def get_market(): return MarketDataService()
-
-@st.cache_resource
-def get_db(): return Database()
-
-@st.cache_resource
-def get_news_service(): return NewsService()
-
-@st.cache_resource
-def get_sentiment(): return NewsSentimentAnalyzer()
-
-@st.cache_data(ttl=900, show_spinner=False)
-def cached_max_analysis(ticker: str, force_train: bool = False):
-    return get_engine().analyze(ticker, force_train=force_train)
+def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    if isinstance(x.columns, pd.MultiIndex):
+        # yfinance may return ticker as a second level
+        x.columns = [c[0] if isinstance(c, tuple) else c for c in x.columns]
+    x = x.rename(columns={c: c.title() for c in x.columns})
+    needed = [c for c in ["Open","High","Low","Close","Volume"] if c in x.columns]
+    x = x[needed].copy()
+    for c in needed:
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+    return x.dropna(subset=["Close"]).sort_index()
 
 @st.cache_data(ttl=600, show_spinner=False)
-def chart_data(ticker: str):
-    prices, provider = get_market().get_history(ticker, period='1y', interval='1d')
-    return add_technical_indicators(prices).tail(220), provider
+def get_history(ticker: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
+    try:
+        return _clean_ohlcv(yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=False))
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_multi_history(tickers: tuple[str, ...], period: str = "1y") -> dict[str, pd.DataFrame]:
+    out = {}
+    try:
+        raw = yf.download(list(tickers), period=period, interval="1d", auto_adjust=False, progress=False, group_by="ticker", threads=False)
+        for t in tickers:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex) and t in raw.columns.get_level_values(0):
+                    out[t] = _clean_ohlcv(raw[t])
+                else:
+                    out[t] = get_history(t, period, "1d")
+            except Exception:
+                out[t] = pd.DataFrame()
+    except Exception:
+        for t in tickers:
+            out[t] = get_history(t, period, "1d")
+    return out
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_info(ticker: str) -> dict[str, Any]:
+    try:
+        info = yf.Ticker(ticker).info or {}
+        return {str(k): v for k, v in info.items()}
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_news(ticker: str, limit: int = 30) -> list[dict[str, Any]]:
+    try:
+        raw = yf.Ticker(ticker).news or []
+    except Exception:
+        raw = []
+    items = []
+    seen = set()
+    for n in raw:
+        c = n.get("content") if isinstance(n, dict) else None
+        if isinstance(c, dict):
+            title = c.get("title") or ""
+            summary = c.get("summary") or c.get("description") or ""
+            provider = (c.get("provider") or {}).get("displayName") if isinstance(c.get("provider"), dict) else "Yahoo Finance"
+            url = (c.get("canonicalUrl") or {}).get("url") if isinstance(c.get("canonicalUrl"), dict) else ""
+            pub = c.get("pubDate") or c.get("displayTime") or ""
+        else:
+            title = n.get("title", "") if isinstance(n, dict) else ""
+            summary = n.get("summary", "") if isinstance(n, dict) else ""
+            provider = n.get("publisher", "Yahoo Finance") if isinstance(n, dict) else "Yahoo Finance"
+            url = n.get("link", "") if isinstance(n, dict) else ""
+            pub = n.get("providerPublishTime", "") if isinstance(n, dict) else ""
+        key = re.sub(r"\W+", "", title.lower())[:120]
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        items.append({"title": title, "summary": summary, "provider": provider, "url": url, "published": pub})
+        if len(items) >= limit:
+            break
+    return items
+
+# ---------------------------- indicators ----------------------------
+
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def sma(s, n): return s.rolling(n).mean()
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    x = df.copy()
+    c, h, l, v = x["Close"], x.get("High", x["Close"]), x.get("Low", x["Close"]), x.get("Volume", pd.Series(index=x.index, dtype=float))
+    ret = c.pct_change()
+    x["ret1"] = ret
+    x["ret3"] = c.pct_change(3)
+    x["ret5"] = c.pct_change(5)
+    x["ret10"] = c.pct_change(10)
+    x["ret20"] = c.pct_change(20)
+    for n in (9,20,50,200): x[f"ema{n}"] = ema(c,n)
+    for n in (20,50,200): x[f"sma{n}"] = sma(c,n)
+    delta = c.diff(); gain = delta.clip(lower=0); loss = -delta.clip(upper=0)
+    rs = gain.ewm(alpha=1/14, adjust=False).mean() / loss.ewm(alpha=1/14, adjust=False).mean().replace(0,np.nan)
+    x["rsi14"] = 100 - 100/(1+rs)
+    macd = ema(c,12)-ema(c,26); sig=ema(macd,9)
+    x["macd"] = macd; x["macd_signal"] = sig; x["macd_hist"] = macd-sig
+    mid=sma(c,20); std=c.rolling(20).std()
+    x["bb_mid"]=mid; x["bb_up"]=mid+2*std; x["bb_low"]=mid-2*std; x["bb_pos"]=(c-x["bb_low"])/(x["bb_up"]-x["bb_low"]).replace(0,np.nan)
+    prev=c.shift(1); tr=pd.concat([(h-l).abs(),(h-prev).abs(),(l-prev).abs()],axis=1).max(axis=1)
+    x["atr14"]=tr.rolling(14).mean(); x["atr_pct"]=x["atr14"]/c
+    tp=(h+l+c)/3
+    if v.notna().any():
+        x["vwap20"]=(tp*v).rolling(20).sum()/v.rolling(20).sum().replace(0,np.nan)
+        x["volume_ratio"] = v / v.rolling(20).mean().replace(0,np.nan)
+        x["volume_z"]=(v-v.rolling(20).mean())/v.rolling(20).std().replace(0,np.nan)
+    else:
+        x["vwap20"]=np.nan; x["volume_ratio"]=np.nan; x["volume_z"]=np.nan
+    x["momentum10"] = c-c.shift(10); x["roc10"] = c.pct_change(10)*100
+    x["volatility20"] = ret.rolling(20).std()*np.sqrt(252)
+    x["support20"] = l.rolling(20).min(); x["resistance20"] = h.rolling(20).max()
+    x["dist_ema20"] = c/x["ema20"]-1; x["dist_ema50"] = c/x["ema50"]-1; x["dist_ema200"] = c/x["ema200"]-1
+    x["trend20"] = x["ema20"].pct_change(10); x["trend50"] = x["ema50"].pct_change(20)
+    return x.replace([np.inf,-np.inf],np.nan)
+
+# ---------------------------- models ----------------------------
+FEATURES = ["ret1","ret3","ret5","ret10","ret20","rsi14","macd","macd_hist","bb_pos","atr_pct","volume_ratio","volume_z","roc10","volatility20","dist_ema20","dist_ema50","dist_ema200","trend20","trend50"]
+
+@dataclass
+class HorizonResult:
+    horizon: int
+    up_probability: float
+    model_probs: dict[str,float]
+    metrics: dict[str,float]
+    expected_return: float
 
 
+def _model_bank():
+    return {
+        "Logistic": Pipeline([("scaler", StandardScaler()), ("model", LogisticRegression(max_iter=400, C=.7, class_weight="balanced"))]),
+        "Random Forest": RandomForestClassifier(n_estimators=160, max_depth=7, min_samples_leaf=5, random_state=42, n_jobs=1, class_weight="balanced_subsample"),
+        "Extra Trees": ExtraTreesClassifier(n_estimators=180, max_depth=8, min_samples_leaf=4, random_state=42, n_jobs=1, class_weight="balanced"),
+        "Hist Gradient": HistGradientBoostingClassifier(max_iter=120, max_leaf_nodes=15, learning_rate=.055, random_state=42),
+    }
+
+
+def _make_dataset(ind: pd.DataFrame, h: int):
+    d = ind.copy()
+    d["future_return"] = d["Close"].shift(-h)/d["Close"]-1
+    d["target"] = (d["future_return"]>0).astype(int)
+    d = d.dropna(subset=FEATURES+["future_return"])
+    return d
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def train_predict(ticker: str, horizon: int) -> HorizonResult | None:
+    raw=get_history(ticker,"5y","1d")
+    if len(raw)<320: return None
+    ind=add_indicators(raw); d=_make_dataset(ind,horizon)
+    if len(d)<220: return None
+    n=len(d); split=max(int(n*.78), n-140); split=min(split,n-70)
+    train=d.iloc[:split]; test=d.iloc[split:]
+    Xtr=train[FEATURES].fillna(0); ytr=train["target"]
+    Xte=test[FEATURES].fillna(0); yte=test["target"]
+    latest=ind[FEATURES].dropna().tail(1)
+    if latest.empty: return None
+    probs={}; weights=[]; pvals=[]; aucs=[]; accs=[]
+    for name,base in _model_bank().items():
+        try:
+            m=clone(base); m.fit(Xtr,ytr)
+            pt=m.predict_proba(Xte)[:,1]
+            pl=float(m.predict_proba(latest.fillna(0))[:,1][0])
+            pred=(pt>=.5).astype(int)
+            acc=accuracy_score(yte,pred)
+            try: auc=roc_auc_score(yte,pt)
+            except Exception: auc=.5
+            w=max(.05, .5*(acc-.45)+.5*(auc-.45))
+            probs[name]=pl; pvals.append(pl); weights.append(w); aucs.append(auc); accs.append(acc)
+        except Exception:
+            continue
+    if not pvals: return None
+    p=float(np.average(pvals,weights=weights))
+    er=float(d["future_return"].tail(500).mean())
+    metrics={"accuracy":float(np.mean(accs)),"roc_auc":float(np.mean(aucs)),"test_n":int(len(test))}
+    return HorizonResult(horizon,p,probs,metrics,er)
+
+# ---------------------------- sentiment / fundamentals / macro ----------------------------
+POS_WORDS={"beat","beats","growth","record","upgrade","surge","strong","profit","profits","bullish","demand","partnership","approval","buyback","raises","raised","outperform","accelerates","expands","launch","wins","win","optimistic"}
+NEG_WORDS={"miss","misses","downgrade","fall","falls","weak","loss","lawsuit","probe","investigation","recall","cuts","cut","warning","bearish","decline","slump","risk","delay","delays","antitrust","tariff","fraud"}
+CATALYST_WORDS={"earnings","guidance","ai","artificial intelligence","deal","acquisition","merger","approval","launch","contract","partnership","buyback","dividend","upgrade"}
+RISK_WORDS={"lawsuit","probe","investigation","downgrade","tariff","antitrust","recall","warning","debt","valuation","delay"}
+
+def score_news(items):
+    scored=[]
+    for it in items:
+        text=(it.get("title","")+" "+it.get("summary","")).lower()
+        toks=set(re.findall(r"[a-z]+",text))
+        pos=len(toks&POS_WORDS); neg=len(toks&NEG_WORDS)
+        score=max(-100,min(100,(pos-neg)*22))
+        importance=min(10,2+2*sum(1 for k in CATALYST_WORDS if k in text)+1.5*sum(1 for k in RISK_WORDS if k in text))
+        scored.append({**it,"score":score,"importance":importance})
+    if scored:
+        w=np.array([max(1,s["importance"]) for s in scored],float); vals=np.array([s["score"] for s in scored],float)
+        overall=float(np.average(vals,weights=w))
+    else: overall=0.0
+    cats=[k for k in CATALYST_WORDS if any(k in (s["title"]+" "+s["summary"]).lower() for s in scored)]
+    risks=[k for k in RISK_WORDS if any(k in (s["title"]+" "+s["summary"]).lower() for s in scored)]
+    return overall,scored,cats[:8],risks[:8]
+
+def fundamental_score(info):
+    score=50.0; notes=[]
+    rg=info.get("revenueGrowth"); eg=info.get("earningsGrowth"); gm=info.get("grossMargins"); om=info.get("operatingMargins"); fpe=info.get("forwardPE"); fcf=info.get("freeCashflow")
+    if isinstance(rg,(int,float)): score+=np.clip(rg*45,-12,12); notes.append(f"Revenue growth {rg*100:.1f}%")
+    if isinstance(eg,(int,float)): score+=np.clip(eg*30,-10,10); notes.append(f"Earnings growth {eg*100:.1f}%")
+    if isinstance(om,(int,float)): score+=np.clip((om-.10)*20,-5,7); notes.append(f"Operating margin {om*100:.1f}%")
+    if isinstance(fpe,(int,float)) and fpe>0:
+        score += 4 if fpe<25 else (-5 if fpe>60 else 0); notes.append(f"Forward P/E {fpe:.1f}")
+    if isinstance(fcf,(int,float)): score += 3 if fcf>0 else -5
+    return float(np.clip(score,0,100)),notes
+
+@st.cache_data(ttl=600, show_spinner=False)
+def macro_snapshot():
+    tickers=("SPY","QQQ","^VIX","^TNX","DX-Y.NYB","SMH")
+    d=get_multi_history(tickers,"6mo")
+    rows=[]; score=50
+    for t in tickers:
+        x=d.get(t,pd.DataFrame())
+        if len(x)>21:
+            last=float(x.Close.iloc[-1]); r5=float(x.Close.pct_change(5).iloc[-1]); r20=float(x.Close.pct_change(20).iloc[-1])
+            rows.append({"Asset":t,"Last":last,"5D":r5,"20D":r20})
+    mp={r["Asset"]:r for r in rows}
+    score += np.clip(mp.get("SPY",{}).get("20D",0)*120,-8,8)
+    score += np.clip(mp.get("QQQ",{}).get("20D",0)*120,-8,8)
+    score += np.clip(mp.get("SMH",{}).get("20D",0)*80,-5,5)
+    vix=mp.get("^VIX",{}).get("Last")
+    if vix: score += 6 if vix<17 else (-8 if vix>28 else 0)
+    tnx=mp.get("^TNX",{}).get("20D",0); score += np.clip(-tnx*80,-5,5)
+    return float(np.clip(score,0,100)),rows
+
+# ---------------------------- Monte Carlo ----------------------------
+
+def bootstrap_paths(close: pd.Series, horizon: int, n_paths: int=6000, seed: int=42):
+    rets=close.pct_change().dropna().tail(756).values
+    if len(rets)<80: return None
+    rng=np.random.default_rng(seed); sampled=rng.choice(rets,size=(n_paths,horizon),replace=True)
+    start=float(close.iloc[-1]); paths=start*np.cumprod(1+sampled,axis=1); terminal=paths[:,-1]
+    return paths,terminal
+
+def range_stats(close,horizon):
+    sim=bootstrap_paths(close,horizon)
+    if sim is None:return {}
+    _,term=sim; q=np.quantile(term,[.05,.1,.5,.9,.95])
+    return {"p05":q[0],"p10":q[1],"p50":q[2],"p90":q[3],"p95":q[4],"up_prob":float(np.mean(term>close.iloc[-1]))}
+
+def touch_probability(close,target,horizon):
+    sim=bootstrap_paths(close,horizon)
+    if sim is None:return np.nan
+    paths,_=sim; start=float(close.iloc[-1])
+    return float(np.mean(np.max(paths,axis=1)>=target)) if target>=start else float(np.mean(np.min(paths,axis=1)<=target))
+
+# ---------------------------- combined analysis ----------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def analyze(ticker: str):
+    ticker=ticker.upper().strip()
+    raw=get_history(ticker,"5y","1d")
+    if raw.empty or len(raw)<260: raise ValueError("无法取得足够历史数据。请检查股票代码或稍后重试。")
+    ind=add_indicators(raw)
+    hres={h:train_predict(ticker,h) for h in (1,3,5)}
+    info=get_info(ticker); fscore,fnotes=fundamental_score(info)
+    news=get_news(ticker,30); nscore,scored,cats,risks=score_news(news)
+    mscore,mrows=macro_snapshot()
+    last=ind.iloc[-1]; tech=50.0
+    tech += 8 if last.get("Close",0)>last.get("ema20",np.inf) else -8
+    tech += 6 if last.get("Close",0)>last.get("ema50",np.inf) else -6
+    tech += 5 if last.get("Close",0)>last.get("ema200",np.inf) else -5
+    rsi=last.get("rsi14",50)
+    tech += 4 if 52<=rsi<=68 else (-5 if rsi>78 else (3 if rsi<35 else 0))
+    tech += 5 if last.get("macd_hist",0)>0 else -5
+    tech=float(np.clip(tech,0,100))
+    news01=np.clip(50+nscore*.35,0,100)
+    probs={h:(hres[h].up_probability if hres[h] else .5) for h in (1,3,5)}
+    fused={}
+    for h in (1,3,5):
+        ml=probs[h]*100
+        fused[h]=float(np.clip((.62*ml+.18*tech+.08*fscore+.07*news01+.05*mscore)/100,0.05,.95))
+    disagreement=np.std([hres[5].model_probs[k] for k in hres[5].model_probs]) if hres.get(5) else .15
+    data_quality=100
+    if len(raw)<700:data_quality-=8
+    if not news:data_quality-=15
+    if not info:data_quality-=12
+    confidence=float(np.clip(82-disagreement*120-abs(fused[5]-.5)*-15 + (data_quality-80)*.35,30,95))
+    vol=float(ind["volatility20"].iloc[-1]) if pd.notna(ind["volatility20"].iloc[-1]) else .35
+    risk=float(np.clip(3.2+vol*7+(100-confidence)/25+(8 if rsi>78 else 0)/10,1,10))
+    ranges={h:range_stats(raw.Close,h) for h in (1,3,5)}
+    return {"ticker":ticker,"raw":raw,"ind":ind,"hres":hres,"fused":fused,"tech":tech,"fund":fscore,"news_score":nscore,"macro":mscore,"confidence":confidence,"data_quality":data_quality,"risk":risk,"info":info,"fnotes":fnotes,"news":scored,"cats":cats,"risks":risks,"macro_rows":mrows,"ranges":ranges}
+
+# ---------------------------- UI ----------------------------
 with st.sidebar:
-    st.title('📈 Stock AI MAX')
-    st.caption('Cloud Safe · 概率校准 · 多来源新闻 · SEC · Walk-forward')
-    mode = st.radio('功能', [
-        '🚀 一键深度分析', '🛰️ 新闻雷达', '🎯 目标价概率', '🏆 股票排行榜',
-        '🧪 回测实验室', '📊 模型准确率', '⚙️ 数据源状态',
-    ], index=0)
-    st.divider()
-    st.caption('云端稳定模式默认开启：限制CPU/内存，避免点击分析后实例崩溃。')
-    st.caption('系统会在数据不足或模型分歧大时主动降低置信度，而不是硬给高概率。')
-    st.caption('研究工具，不构成投资建议。')
+    st.title("📈 Stock AI MAX")
+    page=st.radio("功能",["🚀 深度分析","🛰️ 新闻","🎯 目标价概率","🏆 Scanner","🧪 回测"],index=0)
+    st.divider(); st.caption("Cloud Single-File 版：专门适配 GitHub 网页上传 + Streamlit Community Cloud。")
+    st.caption("概率是模型估计，不是收益保证。")
 
-st.markdown('<div class="hero"><h2 style="margin:0">Stock AI MAX · 美股多因子概率分析</h2><div class="note">技术面 + 市场上下文 + 基本面 + 多来源新闻/SEC + 宏观 + Options + 6模型校准融合 + Monte Carlo + 真实时间顺序回测</div></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h2 style="margin:0">Stock AI MAX · Cloud</h2><div class="small">技术面 + 基本面 + 新闻情绪 + SPY/QQQ/VIX/10Y/DXY/SMH + 4模型融合 + Monte Carlo + Backtest</div></div>',unsafe_allow_html=True)
 
-engine = get_engine()
-
-if mode == '🚀 一键深度分析':
-    c1,c2,c3 = st.columns([2.2,1,1])
-    ticker = c1.text_input('股票代码', value='NVDA', placeholder='NVDA / AVGO / SNDK / AMZN').strip().upper()
-    force_train = c2.toggle('重新训练模型', value=False, help='模型版本升级或你想强制刷新时打开。')
-    run = c3.button('开始 MAX 分析', type='primary', use_container_width=True)
+if page=="🚀 深度分析":
+    c1,c2=st.columns([3,1]); ticker=c1.text_input("股票代码","NVDA").upper().strip(); run=c2.button("开始分析",type="primary",use_container_width=True)
     if run:
         try:
-            with st.spinner(f'正在分析 {ticker}：历史行情 → 6个ML模型 → 新闻/SEC → 宏观 → Options → 多周期… 第一次会慢一些。'):
-                result = cached_max_analysis(ticker, force_train=force_train)
-            st.session_state['max_result'] = result
+            with st.spinner("正在下载行情、训练模型并分析新闻…"):
+                r=analyze(ticker)
+            st.session_state["last_result"]=r
         except Exception as e:
-            st.session_state.pop('max_result', None)
-            st.error(f'分析失败：{type(e).__name__}: {e}')
-            st.info('最常见原因是网络数据源暂时不可用。系统会自动切换数据源，但所有源都失败时仍会停止。')
+            st.error(f"分析失败：{e}")
+    r=st.session_state.get("last_result")
+    if r and r["ticker"]==ticker:
+        p1,p3,p5=r["fused"][1],r["fused"][3],r["fused"][5]
+        cols=st.columns(6)
+        cols[0].metric("1日上涨概率",f"{p1*100:.1f}%")
+        cols[1].metric("3日上涨概率",f"{p3*100:.1f}%")
+        cols[2].metric("5日上涨概率",f"{p5*100:.1f}%")
+        cols[3].metric("Confidence",f"{r['confidence']:.0f}/100")
+        cols[4].metric("Risk",f"{r['risk']:.1f}/10")
+        cols[5].metric("Data Quality",f"{r['data_quality']:.0f}/100")
+        st.subheader("价格情景")
+        rc=st.columns(3)
+        for col,h in zip(rc,(1,3,5)):
+            s=r["ranges"][h]
+            col.markdown(f"**{h}D**")
+            if s: col.write(f"P10 ${s['p10']:.2f} · P50 ${s['p50']:.2f} · P90 ${s['p90']:.2f}")
+        ind=r["ind"].tail(220)
+        fig=go.Figure(); fig.add_trace(go.Candlestick(x=ind.index,open=ind.Open,high=ind.High,low=ind.Low,close=ind.Close,name=ticker))
+        fig.add_trace(go.Scatter(x=ind.index,y=ind.ema20,name="EMA20")); fig.add_trace(go.Scatter(x=ind.index,y=ind.ema50,name="EMA50"))
+        fig.update_layout(height=520,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10)); st.plotly_chart(fig,use_container_width=True)
+        a,b,c,d=st.columns(4); last=ind.iloc[-1]
+        a.metric("RSI 14",f"{last.rsi14:.1f}"); b.metric("MACD Hist",f"{last.macd_hist:.3f}"); c.metric("ATR %",f"{last.atr_pct*100:.2f}%"); d.metric("Volume Ratio",f"{last.volume_ratio:.2f}x" if pd.notna(last.volume_ratio) else "—")
+        st.subheader("多因子评分")
+        sc=st.columns(4); sc[0].metric("Technical",f"{r['tech']:.0f}/100"); sc[1].metric("Fundamental",f"{r['fund']:.0f}/100"); sc[2].metric("News",f"{np.clip(50+r['news_score']*.35,0,100):.0f}/100"); sc[3].metric("Macro",f"{r['macro']:.0f}/100")
+        st.subheader("各模型概率")
+        rows=[]
+        for h in (1,3,5):
+            hr=r["hres"].get(h)
+            if hr:
+                for name,p in hr.model_probs.items(): rows.append({"Horizon":f"{h}D","Model":name,"Up Probability":p,"Test Accuracy":hr.metrics["accuracy"],"ROC AUC":hr.metrics["roc_auc"]})
+        if rows: st.dataframe(pd.DataFrame(rows).style.format({"Up Probability":"{:.1%}","Test Accuracy":"{:.1%}","ROC AUC":"{:.3f}"}),use_container_width=True,hide_index=True)
+        if r["cats"]: st.write("**主要催化剂：** "+", ".join(r["cats"]))
+        if r["risks"]: st.write("**主要风险：** "+", ".join(r["risks"]))
 
-    result = st.session_state.get('max_result')
-    if result and result.get('ticker') == ticker:
-        pro=result['pro']; probs=result['probabilities']; conf=pro['confidence']; news=result.get('news',{}); opt=result.get('options',{})
-        st.subheader(f"{ticker} · {pro['stance']} · 信号质量：{pro['signal_quality']}")
-        cols=st.columns(8)
-        vals=[
-            ('最新价',fmt_money(result['last_price'])),('1日上涨',fmt_pct(probs[1])),('3日上涨',fmt_pct(probs[3])),('5日上涨',fmt_pct(probs[5])),
-            ('5日置信度',f"{conf[5]:.0f}/100"),('风险',f"{result['risk_score']:.1f}/10"),('数据质量',f"{pro['data_quality']:.0f}/100"),('新闻覆盖',f"{news.get('coverage_score',0):.0f}/100"),
-        ]
-        for col,(lab,val) in zip(cols,vals): col.metric(lab,val)
+elif page=="🛰️ 新闻":
+    t=st.text_input("股票代码","NVDA",key="news_t").upper().strip()
+    if st.button("刷新新闻",type="primary"):
+        get_news.clear()
+    items=get_news(t,35); score,scored,cats,risks=score_news(items)
+    st.metric("综合新闻情绪",f"{score:+.0f} / 100")
+    if cats: st.write("**催化剂：** "+", ".join(cats))
+    if risks: st.write("**风险：** "+", ".join(risks))
+    for n in scored:
+        label="Bullish" if n["score"]>15 else ("Bearish" if n["score"]<-15 else "Neutral")
+        st.markdown(f"**{label} · {n['score']:+.0f} · Importance {n['importance']:.0f}/10** — {n['title']}")
+        if n.get("provider"): st.caption(str(n["provider"]))
 
-        if conf[5] < 50:
-            st.warning('模型分歧或历史外推质量不足：当前概率应视为低置信度，系统不会把它包装成强信号。')
-        if news.get('breaking_news_count',0):
-            st.info(f"过去约12小时检测到 {news.get('breaking_news_count')} 条高重要度事件/新闻，短线波动风险更高。")
+elif page=="🎯 目标价概率":
+    t=st.text_input("股票代码","SNDK",key="target_t").upper().strip(); raw=get_history(t,"3y","1d")
+    if not raw.empty:
+        last=float(raw.Close.iloc[-1]); target=st.number_input("目标价格",min_value=0.01,value=float(round(last*1.05,2)),step=.5)
+        c=st.columns(3)
+        for col,h in zip(c,(1,3,5)):
+            p=touch_probability(raw.Close,target,h); col.metric(f"{h}日内触及 ${target:.2f}",f"{p*100:.1f}%" if pd.notna(p) else "—")
+    else: st.warning("无法取得行情。")
 
-        left,right=st.columns([2.15,1])
-        with left:
+elif page=="🏆 Scanner":
+    default="NVDA,AVGO,AMAT,AMZN,GOOGL,META,MSFT,SNDK,AMD"
+    text=st.text_area("股票列表",default,height=90); tickers=[x.strip().upper() for x in re.split(r"[,\s]+",text) if x.strip()][:15]
+    if st.button("开始扫描",type="primary"):
+        out=[]; bar=st.progress(0)
+        for i,t in enumerate(tickers):
             try:
-                frame,provider=chart_data(ticker); fig=go.Figure()
-                fig.add_trace(go.Candlestick(x=frame.index,open=frame.open,high=frame.high,low=frame.low,close=frame.close,name='K线'))
-                for col,name in [('ema_20','EMA20'),('ema_50','EMA50'),('ema_200','EMA200')]:
-                    if col in frame: fig.add_trace(go.Scatter(x=frame.index,y=frame[col],mode='lines',name=name,line={'width':1.2}))
-                fig.update_layout(height=455,margin=dict(l=5,r=5,t=10,b=5),xaxis_rangeslider_visible=False,legend_orientation='h')
-                st.plotly_chart(fig,use_container_width=True); st.caption(f'行情数据源：{provider}')
-            except Exception as e: st.warning(f'图表不可用：{e}')
-        with right:
-            st.markdown('#### MAX 决策面板')
-            st.metric('综合评分',f"{pro['pro_score']:.0f}/100")
-            st.metric('多周期技术',f"{pro['multi_timeframe']['aggregate_score']:.0f}/100")
-            st.metric('市场环境',pro['market_regime']['label'])
-            st.metric('相对强度',f"{result.get('relative_strength',{}).get('score',50):.0f}/100")
-            if opt.get('available'):
-                st.metric('Options 情绪',f"{opt.get('options_score',50):.0f}/100")
-                st.caption(f"最近到期 {opt.get('expiry')} · 隐含波动 {fmt_pct(opt.get('atm_iv'))} · 隐含波幅 {fmt_pct(opt.get('implied_move_pct'))}")
-            else: st.caption('Options 数据当前不可用，不会强行计入。')
+                r=analyze(t); out.append({"Ticker":t,"5D Up":r["fused"][5],"Confidence":r["confidence"],"Risk":r["risk"],"Technical":r["tech"],"News":r["news_score"]})
+            except Exception: pass
+            bar.progress((i+1)/max(1,len(tickers)))
+        if out:
+            df=pd.DataFrame(out).sort_values(["5D Up","Confidence"],ascending=False).reset_index(drop=True); df.index+=1
+            st.dataframe(df.style.format({"5D Up":"{:.1%}","Confidence":"{:.0f}","Risk":"{:.1f}","Technical":"{:.0f}","News":"{:+.0f}"}),use_container_width=True)
 
-        tabs=st.tabs(['AI概率/情景','新闻与SEC','多周期技术','基本面/Options','宏观/相对强度','模型明细'])
-        with tabs[0]:
-            rows=[]
-            for h in (1,3,5):
-                sc=pro['scenarios'][h]; dist=result.get('scenario_distributions',{}).get(h,{})
-                rows.append({'周期':f'{h}个交易日','上涨概率':fmt_pct(probs[h]),'判断':prob_label(probs[h]),'置信度':f"{conf[h]:.0f}/100",
-                             'Bear(P10)':fmt_money(sc['bear']),'Base(P50)':fmt_money(sc['base']),'Bull(P90)':fmt_money(sc['bull']),
-                             '极端下沿(P05)':fmt_money(dist.get('p05')),'极端上沿(P95)':fmt_money(dist.get('p95'))})
-            st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
-            st.caption('P10/P50/P90 来自经验分布 Monte Carlo，并用模型方向做小幅漂移调整；不是保证价格。')
-            st.markdown('##### 模型融合权重')
-            weight_rows=[]
-            for h in (1,3,5):
-                rr={'周期':f'{h}日'}; rr.update({k:f'{v*100:.1f}%' for k,v in result['component_weights'][h].items()}); weight_rows.append(rr)
-            st.dataframe(pd.DataFrame(weight_rows).fillna('—'),hide_index=True,use_container_width=True)
+elif page=="🧪 回测":
+    t=st.text_input("股票代码","NVDA",key="bt_t").upper().strip(); h=st.selectbox("预测周期",[1,3,5],index=2)
+    if st.button("运行时间顺序回测",type="primary"):
+        raw=get_history(t,"5y","1d"); ind=add_indicators(raw); d=_make_dataset(ind,h)
+        if len(d)<300: st.warning("历史数据不足")
+        else:
+            # Expanding-window, limited to 6 folds for cloud stability
+            folds=[]; start=int(len(d)*.55); step=max(45,(len(d)-start)//6)
+            for end in range(start,len(d)-step,step):
+                tr=d.iloc[:end]; te=d.iloc[end:end+step]
+                Xtr=tr[FEATURES].fillna(0); ytr=tr.target; Xte=te[FEATURES].fillna(0); yte=te.target
+                ps=[]
+                for base in _model_bank().values():
+                    try:
+                        m=clone(base); m.fit(Xtr,ytr); ps.append(m.predict_proba(Xte)[:,1])
+                    except Exception: pass
+                if ps:
+                    p=np.mean(ps,axis=0); pred=(p>=.5).astype(int)
+                    try: auc=roc_auc_score(yte,p)
+                    except Exception: auc=np.nan
+                    folds.append({"Accuracy":accuracy_score(yte,pred),"Precision":precision_score(yte,pred,zero_division=0),"Recall":recall_score(yte,pred,zero_division=0),"ROC AUC":auc,"N":len(te)})
+            if folds:
+                f=pd.DataFrame(folds); st.dataframe(f.style.format({c:"{:.1%}" for c in ["Accuracy","Precision","Recall"]}).format({"ROC AUC":"{:.3f}"}),use_container_width=True,hide_index=True)
+                c=st.columns(4); c[0].metric("Accuracy",f"{f.Accuracy.mean():.1%}"); c[1].metric("Precision",f"{f.Precision.mean():.1%}"); c[2].metric("Recall",f"{f.Recall.mean():.1%}"); c[3].metric("ROC AUC",f"{f['ROC AUC'].mean():.3f}")
 
-        with tabs[1]:
-            n1,n2,n3,n4=st.columns(4)
-            n1.metric('新闻情绪',f"{news.get('sentiment_score',0):+.0f}/100")
-            n2.metric('活跃数据源',news.get('source_count',0))
-            n3.metric('覆盖评分',f"{news.get('coverage_score',0):.0f}/100")
-            n4.metric('高重要度突发',news.get('breaking_news_count',0))
-            srcs=news.get('active_sources',[])
-            if srcs: st.markdown(''.join([f'<span class="badge">{s}</span>' for s in srcs]),unsafe_allow_html=True)
-            a,b=st.columns(2)
-            with a:
-                st.markdown('##### 主要催化剂')
-                for x in result.get('catalysts') or ['暂无明确催化剂']: st.write(f'• {x}')
-            with b:
-                st.markdown('##### 主要风险')
-                for x in result.get('risks') or ['暂无明确风险']: st.write(f'• {x}')
-            st.divider()
-            for item in news.get('items',[])[:18]:
-                src=item.get('source',''); label=item.get('label','neutral'); imp=item.get('importance',0); age=item.get('age_hours')
-                age_text=f'{age:.0f}h前' if isinstance(age,(int,float)) else ''
-                st.markdown(f"**{item.get('title','')}**  · `{label}` · 重要度 {imp:.1f}/10 · `{src}` · {age_text}")
-                if item.get('summary'): st.caption(str(item['summary'])[:450])
-
-        with tabs[2]:
-            tf=[]
-            for interval in ('1d','1h','15m','5m'):
-                x=pro['multi_timeframe']['items'][interval]
-                tf.append({'周期':x['label'],'趋势':x['trend'],'评分':'—' if x['score'] is None else f"{x['score']:.0f}/100",'RSI':'—' if x.get('rsi') is None else f"{x['rsi']:.1f}",'ADX':'—' if x.get('adx') is None else f"{x['adx']:.1f}",'K线数':x.get('bars',0),'数据源':x.get('provider') or '—'})
-            st.dataframe(pd.DataFrame(tf),hide_index=True,use_container_width=True)
-            tech=result.get('latest_technical',{})
-            keytech=['rsi_14','macd_hist','adx_14','atr_pct','volume_ratio','return_5d','volatility_20','ema_20','ema_50','ema_200']
-            st.dataframe(pd.DataFrame([{'指标':k,'数值':tech.get(k)} for k in keytech]),hide_index=True,use_container_width=True)
-
-        with tabs[3]:
-            f=result.get('fundamentals',{})
-            fund=[
-                ('Revenue',fmt_big(f.get('revenue'))),('EPS',f"{f.get('eps'):.2f}" if isinstance(f.get('eps'),(int,float)) and math.isfinite(f.get('eps')) else '—'),
-                ('EPS surprise',fmt_pct(f.get('eps_surprise'),already_pct=True)),('Forward PE',f"{f.get('forward_pe'):.1f}" if isinstance(f.get('forward_pe'),(int,float)) and math.isfinite(f.get('forward_pe')) else '—'),
-                ('Market Cap',fmt_big(f.get('market_cap'))),('Free Cash Flow',fmt_big(f.get('free_cash_flow'))),('Gross Margin',fmt_pct(f.get('gross_margin'))),('Operating Margin',fmt_pct(f.get('operating_margin'))),
-                ('Revenue Growth',fmt_pct(f.get('revenue_growth'))),('Earnings Growth',fmt_pct(f.get('earnings_growth'))),('Short % Float',fmt_pct(f.get('short_percent_float'))),('Days to Earnings',f"{f.get('days_to_earnings'):.0f}" if isinstance(f.get('days_to_earnings'),(int,float)) and math.isfinite(f.get('days_to_earnings')) else '—'),
-                ('Analyst Target',fmt_money(f.get('analyst_target_mean'))),('Analyst Count',f"{f.get('analyst_count'):.0f}" if isinstance(f.get('analyst_count'),(int,float)) and math.isfinite(f.get('analyst_count')) else '—'),
-            ]
-            st.dataframe(pd.DataFrame(fund,columns=['指标','数值']),hide_index=True,use_container_width=True)
-            if opt.get('available'):
-                st.markdown('##### Options')
-                st.dataframe(pd.DataFrame([{
-                    '到期日':opt.get('expiry'),'DTE':opt.get('days_to_expiry'),'Put/Call Volume':opt.get('put_call_volume'),'Put/Call OI':opt.get('put_call_open_interest'),
-                    'ATM IV':fmt_pct(opt.get('atm_iv')),'隐含波幅':fmt_pct(opt.get('implied_move_pct')),'Options评分':f"{opt.get('options_score',50):.0f}/100"
-                }]),hide_index=True,use_container_width=True)
-
-        with tabs[4]:
-            m=result.get('macro',{}); rs=result.get('relative_strength',{})
-            macro_rows=[('SPY 5日',fmt_pct(m.get('spy_5d_return'))),('QQQ 5日',fmt_pct(m.get('qqq_5d_return'))),('SMH 5日',fmt_pct(m.get('semiconductors_5d_return'))),('VIX',m.get('vix')),('10Y',m.get('treasury_10y')),('Fed Funds',m.get('fed_funds_rate')),('CPI YoY',fmt_pct(m.get('cpi_yoy'),already_pct=True)),('Core CPI YoY',fmt_pct(m.get('core_cpi_yoy'),already_pct=True)),('失业率',fmt_pct(m.get('unemployment_rate'),already_pct=True)),('10Y-2Y',m.get('yield_curve_10y2y')),('Fed状态',m.get('fed_policy_bias'))]
-            st.dataframe(pd.DataFrame(macro_rows,columns=['指标','数值']),hide_index=True,use_container_width=True)
-            rel=rs.get('relative',{})
-            st.markdown('##### 相对强弱')
-            st.dataframe(pd.DataFrame([{'比较':k,'超额收益':fmt_pct(v)} for k,v in rel.items()]),hide_index=True,use_container_width=True)
-            st.write('市场环境因素：',' · '.join(pro['market_regime']['reasons']) or '暂无')
-
-        with tabs[5]:
-            rows=[]
-            for h in (1,3,5):
-                for name,p in result['model_probabilities'][h].items():
-                    met=result['model_metrics'][h].get(name,{})
-                    rows.append({'周期':f'{h}日','模型':name,'上涨概率':fmt_pct(p),'Accuracy':met.get('accuracy'),'Balanced Acc':met.get('balanced_accuracy'),'ROC AUC':met.get('roc_auc'),'Brier(越低越好)':met.get('brier_score'),'LogLoss':met.get('log_loss')})
-            st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
-            st.caption('模型使用时间顺序 Train → Calibration → Test，概率经过校准；测试集不是随机打乱。')
-
-elif mode == '🛰️ 新闻雷达':
-    ticker=st.text_input('股票代码',value='NVDA').strip().upper()
-    if st.button('扫描全部可用新闻源',type='primary'):
-        try:
-            with st.spinner('并行检查 yfinance / SEC / 已配置新闻 API…'):
-                cov=get_news_service().get_with_coverage(ticker,limit=settings.news_max_items); n=get_sentiment().analyze(cov['items'],coverage=cov)
-            st.session_state['news_radar']=(ticker,n)
-        except Exception as e: st.error(str(e))
-    saved=st.session_state.get('news_radar')
-    if saved and saved[0]==ticker:
-        n=saved[1]; c1,c2,c3,c4=st.columns(4)
-        c1.metric('综合情绪',f"{n['sentiment_score']:+.0f}/100"); c2.metric('文章/事件',len(n['items'])); c3.metric('活跃源',n['source_count']); c4.metric('覆盖',f"{n['coverage_score']:.0f}/100")
-        st.markdown(''.join([f'<span class="badge">{s}</span>' for s in n.get('active_sources',[])]),unsafe_allow_html=True)
-        for x in n['items']:
-            st.markdown(f"**{x.get('title','')}** · `{x.get('source','')}` · `{x.get('label','neutral')}` · 重要度 {x.get('importance',0):.1f}/10")
-            if x.get('summary'): st.caption(str(x['summary'])[:500])
-
-elif mode == '🎯 目标价概率':
-    c1,c2=st.columns(2); ticker=c1.text_input('股票代码',value='SNDK').strip().upper(); target=c2.number_input('目标价格',min_value=.01,value=170.0,step=1.0)
-    condition=st.toggle('使用当前AI方向概率调整模拟',value=True,help='会先运行/复用AI分析，再对经验分布漂移做小幅调整，不会强行改变波动率。')
-    if st.button('计算触及概率',type='primary'):
-        try:
-            p=None
-            if condition:
-                last=st.session_state.get('max_result')
-                if last and last.get('ticker')==ticker: p=last['probabilities'][5]
-                else:
-                    with st.spinner('先计算AI方向概率…'): last=engine.analyze(ticker); p=last['probabilities'][5]; st.session_state['max_result']=last
-            with st.spinner('运行经验分布 Monte Carlo…'): r=engine.predictor.target_touch(ticker,target,direction_prob=p)
-            st.metric('当前价',fmt_money(r['last_price'])); cols=st.columns(3)
-            for col,h in zip(cols,(1,3,5)): col.metric(f'{h}日内触及 {fmt_money(target)}',fmt_pct(r['probabilities'][h]))
-        except Exception as e: st.error(f'计算失败：{e}')
-
-elif mode == '🏆 股票排行榜':
-    text=st.text_area('股票列表（逗号分隔）',value=','.join(settings.default_tickers),height=90); horizon=st.selectbox('周期',[1,3,5],index=2,format_func=lambda x:f'{x}个交易日')
-    if st.button('开始 MAX 扫描',type='primary'):
-        tickers=[x.strip().upper() for x in text.replace('\n',',').split(',') if x.strip()][:25]
-        try:
-            with st.spinner('逐只分析；首次会训练模型，股票越多耗时越长…'): df=scan(tickers,predictor=engine.predictor,horizon=horizon)
-            st.dataframe(df,hide_index=True,use_container_width=True)
-        except Exception as e: st.error(str(e))
-
-elif mode == '🧪 回测实验室':
-    c1,c2,c3=st.columns(3); ticker=c1.text_input('Ticker',value='NVDA').strip().upper(); horizon=c2.selectbox('预测周期',[1,3,5]); method=c3.selectbox('方法',['快速时间顺序 Holdout','Walk-forward（更严格）'])
-    if st.button('运行回测',type='primary'):
-        try:
-            with st.spinner('获取5年历史并按时间顺序回测…'):
-                prices,_=get_market().get_history(ticker,period='5y',interval='1d')
-                r=run_walk_forward(prices,horizon=horizon,max_windows=12) if method.startswith('Walk') else run_backtest(prices,horizon=horizon)
-            rows=[]
-            for name,met in r.items():
-                if name.startswith('_'): continue
-                rows.append({'模型':name,'Accuracy':met.get('prediction_accuracy'),'Balanced Acc':met.get('balanced_accuracy'),'ROC AUC':met.get('roc_auc'),'Brier':met.get('brier_score'),'Win Rate':met.get('win_rate'),'Sharpe':met.get('sharpe_ratio'),'Max Drawdown':met.get('max_drawdown'),'Trades':met.get('trades')})
-                get_db().save_backtest(ticker,horizon,name,met,method=r['_meta'].get('method'))
-            st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True); st.json(r['_meta'])
-            st.caption('Walk-forward 更接近真实使用：每个测试窗口只能使用当时之前的数据训练。历史表现不保证未来。')
-        except Exception as e: st.error(f'回测失败：{e}')
-
-elif mode == '📊 模型准确率':
-    df=get_db().latest_accuracy()
-    if df.empty: st.info('还没有准确率记录。先运行分析或每日学习，之后这里会积累真实结果。')
-    else:
-        st.dataframe(df,hide_index=True,use_container_width=True)
-        st.caption('这里既可能包含训练时的时间顺序测试，也可能包含每日预测兑现后的真实准确率。Sample Size 很小时不要过度解读。')
-
-else:
-    st.subheader('数据源状态')
-    rows=[
-        ('yfinance','免费基础行情/新闻','无需Key','✅'),('SEC EDGAR','官方公司申报/重大文件','建议设置 SEC_USER_AGENT','✅' if settings.sec_user_agent else '⚠️ 建议配置'),
-        ('Alpha Vantage','行情 + 新闻情绪','ALPHA_VANTAGE_API_KEY','✅' if settings.alpha_vantage_api_key else '未配置'),('FMP','行情/财报/新闻','FMP_API_KEY','✅' if settings.fmp_api_key else '未配置'),
-        ('Massive/Polygon','行情 + 新闻','POLYGON_API_KEY','✅' if settings.polygon_api_key else '未配置'),('Finnhub','公司新闻','FINNHUB_API_KEY','✅' if settings.finnhub_api_key else '未配置'),
-        ('Marketaux','全球财经新闻聚合','MARKETAUX_API_KEY','✅' if settings.marketaux_api_key else '未配置'),('FRED','官方宏观历史','FRED_API_KEY（无Key也有CSV fallback）','✅' if settings.fred_api_key else 'Fallback'),
-        ('OpenAI','可选LLM新闻分类','OPENAI_API_KEY','✅' if settings.openai_api_key else '本地情绪模型'),
-    ]
-    st.dataframe(pd.DataFrame(rows,columns=['数据源','用途','配置','状态']),hide_index=True,use_container_width=True)
-    st.markdown('#### 在线网页部署')
-    st.write('本项目已经是 Streamlit Cloud / Render / Railway 可部署结构。最简单的方式是把整个文件夹上传到 GitHub，再在 Streamlit Community Cloud 选择 `app.py`。API Key 放到云端 Secrets，不要写进代码。')
-    st.code('streamlit run app.py',language='bash')
-    st.caption('你不需要在 Windows 上运行 BAT；云端部署成功后，以后只打开网址。')
-
-st.divider(); st.caption('⚠️ “最高准确率”不能被保证。MAX 版重点是减少数据泄漏、校准概率、增加新闻/SEC/Options/宏观覆盖，并在低质量数据时降低置信度。')
+st.divider(); st.caption("Stock AI MAX Cloud is a research tool. Model probabilities and simulations are estimates, not guarantees or personalized investment advice.")
