@@ -1,40 +1,29 @@
-# Test Report — Stock AI MAX v2
+# Stock AI MAX ULTRA v3 — Test Report
 
-Date: 2026-09-06
+Build date: 2026-09-06
 
-## Passed
+## Passed checks
+- Python `py_compile`: PASS
+- Synthetic OHLCV indicator pipeline: PASS
+- RSI/MACD/ATR/ADX/Stochastic/MFI/OBV/volume features: PASS
+- News scoring and recency weighting: PASS
+- Empirical Monte Carlo bootstrap: PASS
+- Four-model 1D/3D/5D training pipeline: PASS
+- Chronological validation/test split: PASS
+- Probability calibration fallback / shrinkage: PASS
+- Full offline `analyze_max()` integration with mocked live providers: PASS
+- Risk / confidence / data-quality bounds: PASS
 
-- `python -m compileall` — passed for the full project.
-- `pytest -q` — **10 passed**.
-- Synthetic end-to-end integration — passed:
-  - 5-year-like OHLCV input
-  - SPY / QQQ / VIX / 10Y context
-  - 6 ML models
-  - 1 / 3 / 5 day probabilities
-  - probability calibration
-  - ensemble
-  - empirical Monte Carlo
-  - SQLite persistence
-  - news / fundamentals / options / relative-strength injection
+## Cloud stability protections verified in code
+- No heavy analysis on initial page load
+- Network calls use explicit connect/read timeouts
+- Retries are bounded to one retry
+- Main analysis, news aggregation, intraday fetch and scanner use Streamlit-safe sequential execution
+- Random Forest / Extra Trees use `n_jobs=1`
+- Options analysis is opt-in and off by default
+- Cached functions have TTL and max-entry limits
+- Provider failures are isolated and returned in module-health tables
+- Top-level exception shield renders a diagnostic instead of a blank page
 
-Example synthetic integration output produced valid probabilities and confidence for all 3 horizons.
-
-## Environment limitation during verification
-
-`pip install -r requirements.txt` was executed in the build container. Installed packages were detected, but the container could not reach PyPI because DNS/network access was unavailable, so missing packages such as `yfinance` / `streamlit` could not be downloaded in this environment.
-
-Because Streamlit was not installed in the build container and could not be downloaded, a live local Streamlit server could not be started here. The app source itself passed Python compilation.
-
-On Streamlit Community Cloud / a normal Internet-connected Python 3.12 environment, `requirements.txt` is the deployment dependency file.
-
-## Test suite
-
-- technical indicator tests
-- Monte Carlo tests
-- SQLite tests
-- six-model training tests
-- chronological backtest tests
-- walk-forward smoke test
-- market-context feature alignment
-- news deduplication
-- import checks
+## Note
+Live external APIs were not called in the offline test environment. The code is designed to fail soft and fall back when a provider is unavailable or an API key is missing.
